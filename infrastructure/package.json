@@ -1,0 +1,22 @@
+{
+  "name": "auth0-streaming-analytics",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "synth": "cdk synth --all --profile btaws",
+    "deploy": "cdk deploy --all --profile btaws",
+    "diff": "cdk diff --all --profile btaws"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.177.0",
+    "constructs": "^10.3.0"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-athena": "^3.1130.0",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "~5.6.0"
+  }
+}
