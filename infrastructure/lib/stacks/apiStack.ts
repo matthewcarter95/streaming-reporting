@@ -24,6 +24,47 @@ export class ApiStack extends cdk.Stack {
     const auth0Audience = this.node.tryGetContext('auth0Audience') as string;
     const tenantClaim = (this.node.tryGetContext('tenantClaim') as string | undefined) ?? 'org_id';
     const corsOrigins = ((this.node.tryGetContext('corsOrigins') as string | undefined) ?? '*').split(',');
+    const additionalIssuers = ((this.node.tryGetContext('additionalIssuers') as string | undefined) ?? '').split(',').filter(Boolean);
+
+    const trustedIssuers = [
+      `https://${auth0Domain}/`,
+      ...additionalIssuers,
+    ].join(',');
+
+    // Lambda authorizer — validates JWTs from any trusted issuer
+    const authorizerLogGroup = new logs.LogGroup(this, 'AuthorizerLogGroup', {
+      logGroupName: '/aws/lambda/auth0-analytics-authorizer',
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const authorizerFn = new NodejsFunction(this, 'AuthorizerFunction', {
+      functionName: 'auth0-analytics-authorizer',
+      entry: path.join(__dirname, '../lambda/authorizer/index.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_22_X,
+      timeout: cdk.Duration.seconds(10),
+      memorySize: 128,
+      logGroup: authorizerLogGroup,
+      environment: {
+        TRUSTED_ISSUERS: trustedIssuers,
+      },
+      bundling: {
+        externalModules: [],
+        minify: true,
+      },
+    });
+
+    const lambdaAuthorizer = new authorizers.HttpLambdaAuthorizer(
+      'Auth0LambdaAuthorizer',
+      authorizerFn,
+      {
+        authorizerName: 'auth0-multi-issuer',
+        responseTypes: [authorizers.HttpLambdaResponseType.SIMPLE],
+        resultsCacheTtl: cdk.Duration.seconds(300),
+        identitySource: ['$request.header.Authorization'],
+      },
+    );
 
     const reportingLogGroup = new logs.LogGroup(this, 'ReportingLogGroup', {
       logGroupName: '/aws/lambda/auth0-analytics-reports',
@@ -45,6 +86,7 @@ export class ApiStack extends cdk.Stack {
         ATHENA_WORKGROUP: athenaWorkgroup.name,
         S3_RESULTS_BUCKET: eventsBucket.bucketName,
         TENANT_CLAIM: tenantClaim,
+        DEFAULT_TENANT: auth0Domain.split('.')[0], // e.g. dev-cs5j6vau
       },
       bundling: {
         // @aws-sdk/* is available in the Lambda Node 20 runtime
@@ -79,16 +121,6 @@ export class ApiStack extends cdk.Stack {
     eventsBucket.grantRead(reportingFn);
     eventsBucket.grantPut(reportingFn, 'athena-results/*');
 
-    // HTTP API with Auth0 JWT authorizer
-    const jwtAuthorizer = new authorizers.HttpJwtAuthorizer(
-      'Auth0JwtAuthorizer',
-      `https://${auth0Domain}/`,
-      {
-        jwtAudience: [auth0Audience],
-        authorizerName: 'auth0-jwt',
-      },
-    );
-
     const httpApi = new apigatewayv2.HttpApi(this, 'ReportingApi', {
       apiName: 'auth0-analytics-api',
       corsPreflight: {
@@ -105,7 +137,7 @@ export class ApiStack extends cdk.Stack {
       path: '/reports/{proxy+}',
       methods: [apigatewayv2.HttpMethod.GET],
       integration,
-      authorizer: jwtAuthorizer,
+      authorizer: lambdaAuthorizer,
     });
 
     new cdk.CfnOutput(this, 'ApiUrl', {

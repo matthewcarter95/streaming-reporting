@@ -2,6 +2,7 @@
   "app": "npx ts-node --prefer-ts-exts bin/app.ts",
   "context": {
     "auth0Domain": "dev-cs5j6vau.us.auth0.com",
+    "additionalIssuers": "https://passkey-phone.demo-connect.us/",
     "auth0Audience": "api://streaming.example",
     "corsOrigins": "*",
     "tenantClaim": "org_id",

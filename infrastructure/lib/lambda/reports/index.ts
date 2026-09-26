@@ -15,6 +15,7 @@ const TABLE = process.env.ATHENA_TABLE ?? 'logs';
 const WORKGROUP = process.env.ATHENA_WORKGROUP ?? 'auth0-analytics';
 const RESULTS_BUCKET = process.env.S3_RESULTS_BUCKET!;
 const TENANT_CLAIM = process.env.TENANT_CLAIM ?? 'org_id';
+const DEFAULT_TENANT = process.env.DEFAULT_TENANT ?? 'dev-cs5j6vau';
 
 // Tenant claim must be alphanumeric slugs only — validated before use in SQL
 const SAFE_TENANT_RE = /^[a-zA-Z0-9_-]+$/;
@@ -33,12 +34,16 @@ interface LambdaEvent {
   queryStringParameters?: Record<string, string>;
 }
 
-function getTenantId(event: LambdaEvent): string | null {
+function getTenantId(event: LambdaEvent): string {
+  // Lambda authorizer context (new path)
+  const lambdaCtx = (event.requestContext?.authorizer as Record<string, unknown> | undefined)?.lambda as Record<string, string> | undefined;
+  if (lambdaCtx?.tenantId && SAFE_TENANT_RE.test(lambdaCtx.tenantId)) return lambdaCtx.tenantId;
+  // Built-in JWT authorizer claims (legacy path, kept for direct invocation testing)
   const claims = event.requestContext?.authorizer?.jwt?.claims;
-  if (!claims) return null;
-  const tenant = claims[TENANT_CLAIM] ?? claims['org_id'] ?? null;
-  if (!tenant || !SAFE_TENANT_RE.test(tenant)) return null;
-  return tenant;
+  const tenant = claims?.[TENANT_CLAIM] ?? claims?.['org_id'];
+  if (tenant && SAFE_TENANT_RE.test(tenant)) return tenant;
+  // Default — single-tenant mode
+  return DEFAULT_TENANT;
 }
 
 async function runQuery(sql: string): Promise<Record<string, string>[]> {
@@ -159,9 +164,6 @@ function response(statusCode: number, body: unknown) {
 
 export const handler = async (event: LambdaEvent) => {
   const tenantId = getTenantId(event);
-  if (!tenantId) {
-    return response(401, { error: 'Missing or invalid tenant claim in JWT' });
-  }
 
   const days = parseInt(event.queryStringParameters?.days ?? '30', 10);
   const path = event.rawPath ?? '';
