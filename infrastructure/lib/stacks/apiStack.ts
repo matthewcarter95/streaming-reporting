@@ -2,10 +2,13 @@ import * as cdk from 'aws-cdk-lib';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as apigatewayv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import * as integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import * as authorizers from 'aws-cdk-lib/aws-apigatewayv2-authorizers';
-import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
+import { NodejsFunction, OutputFormat } from 'aws-cdk-lib/aws-lambda-nodejs';
 import { Construct } from 'constructs';
 import * as path from 'path';
 import { StorageStack } from './storageStack';
@@ -121,11 +124,195 @@ export class ApiStack extends cdk.Stack {
     eventsBucket.grantRead(reportingFn);
     eventsBucket.grantPut(reportingFn, 'athena-results/*');
 
+    const teamsSlug           = (this.node.tryGetContext('teamsSlug')          as string | undefined) ?? '';
+    const teamsApiKeySecretArn = (this.node.tryGetContext('teamsApiKeySecretArn') as string | undefined)
+      ?? `arn:aws:secretsmanager:${this.region}:${this.account}:secret:auth0/teams/api-key`;
+    const defaultLocality     = (this.node.tryGetContext('defaultLocality')    as string | undefined) ?? 'US-3';
+
+    const provisionerLogGroup = new logs.LogGroup(this, 'ProvisionerLogGroup', {
+      logGroupName: '/aws/lambda/auth0-tenant-provisioner',
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const provisionFn = new NodejsFunction(this, 'TenantProvisionerFunction', {
+      functionName: 'auth0-tenant-provisioner',
+      entry: path.join(__dirname, '../lambda/provision-tenant/index.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_22_X,
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 256,
+      logGroup: provisionerLogGroup,
+      environment: {
+        TRUSTED_ISSUERS:         trustedIssuers,
+        TEAMS_SLUG:              teamsSlug,
+        TEAMS_API_KEY_SECRET_ARN: teamsApiKeySecretArn,
+        DEFAULT_LOCALITY:        defaultLocality,
+      },
+      bundling: {
+        externalModules: ['@aws-sdk/*'],
+        minify: true,
+      },
+    });
+
+    // DynamoDB table for tenant provisioning status
+    const tenantTable = new dynamodb.Table(this, 'TenantTable', {
+      tableName: 'auth0-provisioned-tenants',
+      partitionKey: { name: 'tenant_id', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    // GSI: query all tenants created by a given user (by Auth0 sub)
+    tenantTable.addGlobalSecondaryIndex({
+      indexName: 'by-creator',
+      partitionKey: { name: 'created_by_sub', type: dynamodb.AttributeType.STRING },
+      sortKey:      { name: 'created_at',     type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
+    // Provision Lambda: write status + publish EventBridge event
+    provisionFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:PutItem'],
+      resources: [tenantTable.tableArn],
+    }));
+    provisionFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['events:PutEvents'],
+      resources: [`arn:aws:events:${this.region}:${this.account}:event-bus/default`],
+    }));
+    provisionFn.addEnvironment('TENANT_TABLE', tenantTable.tableName);
+
+    // Status Lambda
+    const statusLogGroup = new logs.LogGroup(this, 'StatusLogGroup', {
+      logGroupName: '/aws/lambda/auth0-tenant-status',
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const statusFn = new NodejsFunction(this, 'StatusFunction', {
+      functionName: 'auth0-tenant-status',
+      entry: path.join(__dirname, '../lambda/status-tenant/index.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_22_X,
+      timeout: cdk.Duration.seconds(10),
+      memorySize: 128,
+      logGroup: statusLogGroup,
+      environment: { TENANT_TABLE: tenantTable.tableName },
+      bundling: { externalModules: ['@aws-sdk/*'], minify: true },
+    });
+    tenantTable.grantReadData(statusFn);
+
+    // Configure Lambda — runs after tenant creation to replicate the d_tenant
+    // Terraform config (Actions, connection, log stream, prompt, portal) via
+    // direct Management API calls, triggered by the tenant.provisioned event.
+    const personaApiKeySecretArn = (this.node.tryGetContext('personaApiKeySecretArn') as string | undefined)
+      ?? 'arn:aws:secretsmanager:us-east-1:204352680806:secret:dvly/idv/persona/apikey-lwVEYE';
+    const personaDomain = (this.node.tryGetContext('personaDomain') as string | undefined) ?? 'withpersona.com';
+    const personaInquiryTemplateId = this.node.tryGetContext('personaInquiryTemplateId') as string;
+
+    const configureLogGroup = new logs.LogGroup(this, 'ConfigureLogGroup', {
+      logGroupName: '/aws/lambda/auth0-tenant-configurer',
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const configureFn = new NodejsFunction(this, 'TenantConfigurerFunction', {
+      functionName: 'auth0-tenant-configurer',
+      entry: path.join(__dirname, '../lambda/configure-tenant/index.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_22_X,
+      timeout: cdk.Duration.seconds(120),
+      memorySize: 256,
+      logGroup: configureLogGroup,
+      environment: {
+        TENANT_TABLE:                  tenantTable.tableName,
+        PERSONA_API_KEY_SECRET_ARN:    personaApiKeySecretArn,
+        PERSONA_DOMAIN:                personaDomain,
+        PERSONA_INQUIRY_TEMPLATE_ID:   personaInquiryTemplateId,
+        EVENTBRIDGE_AWS_ACCOUNT_ID:    '223778538359',
+        EVENTBRIDGE_AWS_REGION:        'us-east-1',
+      },
+      bundling: { externalModules: ['@aws-sdk/*'], minify: true },
+    });
+
+    tenantTable.grantWriteData(configureFn);
+    configureFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: [
+        `arn:aws:secretsmanager:${this.region}:${this.account}:secret:auth0/tenants/*`,
+        personaApiKeySecretArn,
+      ],
+    }));
+
+    new events.Rule(this, 'TenantProvisionedRule', {
+      eventPattern: {
+        source:     ['auth0.provisioner'],
+        detailType: ['tenant.provisioned'],
+      },
+      targets: [new targets.LambdaFunction(configureFn)],
+    });
+
+    // MCP Lambda — exposes a tenant's Management API as MCP tools (via the
+    // @auth0/auth0-mcp-server library) to the chatbot user who owns that tenant.
+    const mcpLogGroup = new logs.LogGroup(this, 'McpLogGroup', {
+      logGroupName: '/aws/lambda/auth0-tenant-mcp',
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const mcpFn = new NodejsFunction(this, 'TenantMcpFunction', {
+      functionName: 'auth0-tenant-mcp',
+      entry: path.join(__dirname, '../lambda/mcp-tenant/index.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_22_X,
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 512,
+      logGroup: mcpLogGroup,
+      environment: { TENANT_TABLE: tenantTable.tableName },
+      // ESM output (not the default CJS) — @auth0/auth0-mcp-server's analytics
+      // util uses createRequire(import.meta.url) to load its package.json;
+      // esbuild's CJS shim for import.meta.url resolves to undefined, which
+      // breaks that call. Real ESM output keeps import.meta.url valid.
+      // The banner replaces esbuild's own broken `require` shim (which throws
+      // "Dynamic require of ... is not supported" for CJS deps like `debug`
+      // that call require('tty') at module load) with a real one.
+      // @auth0/auth0-mcp-server is left out of the esbuild bundle entirely
+      // (nodeModules, not externalModules) because its own package.json
+      // version lookup does `require('../../package.json')` relative to its
+      // *own file location* — flattening it into index.mjs breaks that
+      // relative path. Installing it as a real node_modules package keeps
+      // its internal directory layout (and that lookup) intact.
+      bundling: {
+        externalModules: ['@aws-sdk/*'],
+        nodeModules: ['@auth0/auth0-mcp-server'],
+        minify: true,
+        format: OutputFormat.ESM,
+        banner: "import { createRequire as __cjsCompatRequire } from 'module'; const require = __cjsCompatRequire(import.meta.url);",
+      },
+    });
+
+    tenantTable.grantReadData(mcpFn);
+    mcpFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:auth0/tenants/*`],
+    }));
+
+    // Read the Teams API key at runtime (never in env vars or CloudFormation)
+    provisionFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: [teamsApiKeySecretArn],
+    }));
+
+    // Write management_client credentials for each provisioned tenant
+    provisionFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['secretsmanager:CreateSecret', 'secretsmanager:TagResource'],
+      resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:auth0/tenants/*`],
+    }));
+
     const httpApi = new apigatewayv2.HttpApi(this, 'ReportingApi', {
       apiName: 'auth0-analytics-api',
       corsPreflight: {
         allowOrigins: corsOrigins,
-        allowMethods: [apigatewayv2.CorsHttpMethod.GET, apigatewayv2.CorsHttpMethod.OPTIONS],
+        allowMethods: [apigatewayv2.CorsHttpMethod.GET, apigatewayv2.CorsHttpMethod.POST, apigatewayv2.CorsHttpMethod.OPTIONS],
         allowHeaders: ['Authorization', 'Content-Type'],
         maxAge: cdk.Duration.hours(1),
       },
@@ -138,6 +325,42 @@ export class ApiStack extends cdk.Stack {
       methods: [apigatewayv2.HttpMethod.GET],
       integration,
       authorizer: lambdaAuthorizer,
+    });
+
+    httpApi.addRoutes({
+      path: '/tenants',
+      methods: [apigatewayv2.HttpMethod.POST],
+      integration: new integrations.HttpLambdaIntegration('TenantProvisionerIntegration', provisionFn),
+      authorizer: lambdaAuthorizer,
+    });
+
+    httpApi.addRoutes({
+      path: '/tenants/{tenantId}/status',
+      methods: [apigatewayv2.HttpMethod.GET],
+      integration: new integrations.HttpLambdaIntegration('TenantStatusIntegration', statusFn),
+      authorizer: lambdaAuthorizer,
+    });
+
+    httpApi.addRoutes({
+      path: '/mcp/{tenantId}',
+      methods: [apigatewayv2.HttpMethod.POST],
+      integration: new integrations.HttpLambdaIntegration('TenantMcpIntegration', mcpFn),
+      authorizer: lambdaAuthorizer,
+    });
+
+    new cdk.CfnOutput(this, 'TenantProvisionerFunctionArn', {
+      value: provisionFn.functionArn,
+      exportName: 'Auth0Analytics-TenantProvisionerArn',
+    });
+
+    new cdk.CfnOutput(this, 'TenantConfigurerFunctionArn', {
+      value: configureFn.functionArn,
+      exportName: 'Auth0Analytics-TenantConfigurerArn',
+    });
+
+    new cdk.CfnOutput(this, 'TenantMcpFunctionArn', {
+      value: mcpFn.functionArn,
+      exportName: 'Auth0Analytics-TenantMcpArn',
     });
 
     new cdk.CfnOutput(this, 'ApiUrl', {
