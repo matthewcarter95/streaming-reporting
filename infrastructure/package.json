@@ -5,9 +5,9 @@
   "scripts": {
     "build": "tsc",
     "watch": "tsc -w",
-    "synth": "cdk synth --all --profile btaws",
-    "deploy": "cdk deploy --all --profile btaws",
-    "diff": "cdk diff --all --profile btaws"
+    "synth": "cdk synth --all",
+    "deploy": "cdk deploy --all",
+    "diff": "cdk diff --all"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.1141.0",
@@ -19,9 +19,8 @@
   },
   "devDependencies": {
     "@aws-sdk/client-athena": "^3.1130.0",
-    "@aws-sdk/client-dynamodb": "^3.1146.0",
     "@aws-sdk/client-eventbridge": "^3.1146.0",
-    "@aws-sdk/client-secrets-manager": "^3.1146.0",
+    "@aws-sdk/client-ssm": "^3.1146.0",
     "@types/node": "^22.0.0",
     "aws-cdk": "^2.1141.0",
     "esbuild": "^0.24.0",

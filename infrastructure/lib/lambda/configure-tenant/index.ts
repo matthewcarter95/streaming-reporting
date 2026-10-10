@@ -1,19 +1,47 @@
-import {
-  SecretsManagerClient,
-  GetSecretValueCommand,
-} from '@aws-sdk/client-secrets-manager';
+import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { DynamoDBClient, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
 
+// The OCI Vault reader comes from the dvly-oci-secrets Lambda layer and is
+// intentionally not bundled (see externalModules in apiStack.ts).
+interface OciSecretsModule {
+  configure(overrides: { privateKeyPem?: string }): void;
+  getSecretByOcid(ocid: string): Promise<string>;
+  getSecretByName(name: string): Promise<string>;
+}
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const ociSecrets = require('dvly-oci-secrets') as OciSecretsModule;
+
 const region = process.env.AWS_REGION ?? 'us-east-1';
-const secretsClient = new SecretsManagerClient({ region });
 const dynamoClient  = new DynamoDBClient({ region });
 
 const TENANT_TABLE                = process.env.TENANT_TABLE ?? 'auth0-provisioned-tenants';
-const PERSONA_API_KEY_SECRET_ARN  = process.env.PERSONA_API_KEY_SECRET_ARN!;
+const PERSONA_API_KEY_SECRET_OCID = process.env.PERSONA_API_KEY_SECRET_OCID!;
+const OCI_KEY_SSM_NAME            = process.env.OCI_KEY_SSM_NAME!;
 const PERSONA_DOMAIN              = process.env.PERSONA_DOMAIN ?? 'withpersona.com';
 const PERSONA_INQUIRY_TEMPLATE_ID = process.env.PERSONA_INQUIRY_TEMPLATE_ID!;
 const EVENTBRIDGE_AWS_ACCOUNT_ID  = process.env.EVENTBRIDGE_AWS_ACCOUNT_ID ?? '223778538359';
 const EVENTBRIDGE_AWS_REGION      = process.env.EVENTBRIDGE_AWS_REGION ?? 'us-east-1';
+
+// OCI secret name for a tenant's management_client credentials (see provision-tenant).
+const TENANT_SECRET_PREFIX = 'auth0.tenants.';
+const tenantSecretName = (tenantId: string) => `${TENANT_SECRET_PREFIX}${tenantId}`;
+
+// Fetch the OCI signing key from SSM once per container and configure the layer.
+let _ociReady: Promise<void> | null = null;
+function initOci(): Promise<void> {
+  if (!_ociReady) {
+    _ociReady = (async () => {
+      const ssm = new SSMClient({ region });
+      const resp = await ssm.send(new GetParameterCommand({
+        Name: OCI_KEY_SSM_NAME,
+        WithDecryption: true,
+      }));
+      const privateKeyPem = Buffer.from(resp.Parameter?.Value ?? '', 'base64').toString('utf8');
+      ociSecrets.configure({ privateKeyPem });
+    })();
+  }
+  return _ociReady;
+}
 
 const PORTAL_APP_NAME = 'd-tenant-portal-app';
 const PORTAL_NAME     = 'd-tenant-portal';
@@ -37,18 +65,15 @@ let cachedPersonaApiKey: string | null = null;
 
 async function getPersonaApiKey(): Promise<string> {
   if (cachedPersonaApiKey) return cachedPersonaApiKey;
-  const res = await secretsClient.send(new GetSecretValueCommand({
-    SecretId: PERSONA_API_KEY_SECRET_ARN,
-  }));
-  cachedPersonaApiKey = res.SecretString!;
+  await initOci();
+  cachedPersonaApiKey = await ociSecrets.getSecretByOcid(PERSONA_API_KEY_SECRET_OCID);
   return cachedPersonaApiKey;
 }
 
 async function getManagementClient(tenantId: string): Promise<ManagementClientSecret> {
-  const res = await secretsClient.send(new GetSecretValueCommand({
-    SecretId: `auth0/tenants/${tenantId}`,
-  }));
-  return JSON.parse(res.SecretString!) as ManagementClientSecret;
+  await initOci();
+  const value = await ociSecrets.getSecretByName(tenantSecretName(tenantId));
+  return JSON.parse(value) as ManagementClientSecret;
 }
 
 async function getAccessToken(domain: string, clientId: string, clientSecret: string): Promise<string> {

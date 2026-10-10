@@ -33,6 +33,53 @@ export class ApiStack extends cdk.Stack {
     // the underlying tenant URL, so we only need the one issuer here.
     const trustedIssuers = `https://${auth0Domain}/`;
 
+    // ── OCI Vault Secrets ──────────────────────────────────────────────────────
+    // Static and per-tenant secrets live in OCI Vault (Oracle Cloud). The
+    // Lambdas authenticate with OCI Signature v1 using an RSA key; the key PEM
+    // is stored (base64) in AWS SSM Parameter Store and fetched at cold start.
+    const ociRegion          = (this.node.tryGetContext('ociRegion')          as string | undefined) ?? 'us-ashburn-1';
+    const ociTenancyOcid     = (this.node.tryGetContext('ociTenancyOcid')     as string | undefined) ?? '';
+    const ociUserOcid        = (this.node.tryGetContext('ociUserOcid')        as string | undefined) ?? '';
+    const ociKeyFingerprint  = (this.node.tryGetContext('ociKeyFingerprint')  as string | undefined) ?? '';
+    const ociKeySsmName      = (this.node.tryGetContext('ociKeySsmName')      as string | undefined) ?? '/dvly/oci/private-key';
+    const ociVaultOcid       = (this.node.tryGetContext('ociVaultOcid')       as string | undefined) ?? '';
+    const ociCompartmentOcid = (this.node.tryGetContext('ociCompartmentOcid') as string | undefined) ?? '';
+    const ociKeyId           = (this.node.tryGetContext('ociKeyId')           as string | undefined) ?? '';
+
+    const teamsApiKeySecretOcid   = (this.node.tryGetContext('teamsApiKeySecretOcid')   as string | undefined) ?? '';
+    const personaApiKeySecretOcid = (this.node.tryGetContext('personaApiKeySecretOcid') as string | undefined) ?? '';
+
+    const ociEnv = {
+      OCI_REGION:           ociRegion,
+      OCI_TENANCY_OCID:     ociTenancyOcid,
+      OCI_USER_OCID:        ociUserOcid,
+      OCI_KEY_FINGERPRINT:  ociKeyFingerprint,
+      OCI_KEY_SSM_NAME:     ociKeySsmName,
+      OCI_VAULT_OCID:       ociVaultOcid,
+      OCI_COMPARTMENT_OCID: ociCompartmentOcid,
+      OCI_KEY_ID:           ociKeyId,
+    };
+
+    // Shared layer with the OCI Vault reader/writer (OCI Signature v1).
+    const ociSecretsLayer = new lambda.LayerVersion(this, 'OciSecretsLayer', {
+      layerVersionName: 'dvly-oci-secrets',
+      code: lambda.Code.fromAsset(path.join(__dirname, '../../layers/oci-secrets')),
+      compatibleRuntimes: [lambda.Runtime.NODEJS_22_X],
+      description: 'Read/write secrets in OCI Vault via OCI Signature v1 (RSA-SHA256)',
+    });
+
+    // The OCI private key is fetched from SSM (SecureString) at cold start.
+    const grantOciKeyRead = (fn: lambda.Function) => {
+      fn.addToRolePolicy(new iam.PolicyStatement({
+        actions: ['ssm:GetParameter'],
+        resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${ociKeySsmName}`],
+      }));
+      fn.addToRolePolicy(new iam.PolicyStatement({
+        actions: ['kms:Decrypt'],
+        resources: [`arn:aws:kms:${this.region}:${this.account}:alias/aws/ssm`],
+      }));
+    };
+
     // Lambda authorizer — validates JWTs from any trusted issuer
     const authorizerLogGroup = new logs.LogGroup(this, 'AuthorizerLogGroup', {
       logGroupName: '/aws/lambda/auth0-analytics-authorizer',
@@ -129,8 +176,6 @@ export class ApiStack extends cdk.Stack {
     eventsBucket.grantPut(reportingFn, 'athena-results/*');
 
     const teamsSlug           = (this.node.tryGetContext('teamsSlug')          as string | undefined) ?? '';
-    const teamsApiKeySecretArn = (this.node.tryGetContext('teamsApiKeySecretArn') as string | undefined)
-      ?? `arn:aws:secretsmanager:${this.region}:${this.account}:secret:auth0/teams/api-key`;
     const defaultLocality     = (this.node.tryGetContext('defaultLocality')    as string | undefined) ?? 'US-3';
 
     const provisionerLogGroup = new logs.LogGroup(this, 'ProvisionerLogGroup', {
@@ -148,13 +193,15 @@ export class ApiStack extends cdk.Stack {
       memorySize: 256,
       logGroup: provisionerLogGroup,
       environment: {
-        TRUSTED_ISSUERS:         trustedIssuers,
-        TEAMS_SLUG:              teamsSlug,
-        TEAMS_API_KEY_SECRET_ARN: teamsApiKeySecretArn,
-        DEFAULT_LOCALITY:        defaultLocality,
+        TRUSTED_ISSUERS:            trustedIssuers,
+        TEAMS_SLUG:                 teamsSlug,
+        TEAMS_API_KEY_SECRET_OCID:  teamsApiKeySecretOcid,
+        DEFAULT_LOCALITY:           defaultLocality,
+        ...ociEnv,
       },
+      layers: [ociSecretsLayer],
       bundling: {
-        externalModules: ['@aws-sdk/*'],
+        externalModules: ['@aws-sdk/*', 'dvly-oci-secrets'],
         minify: true,
       },
     });
@@ -208,8 +255,6 @@ export class ApiStack extends cdk.Stack {
     // Configure Lambda — runs after tenant creation to replicate the d_tenant
     // Terraform config (Actions, connection, log stream, prompt, portal) via
     // direct Management API calls, triggered by the tenant.provisioned event.
-    const personaApiKeySecretArn = (this.node.tryGetContext('personaApiKeySecretArn') as string | undefined)
-      ?? 'arn:aws:secretsmanager:us-east-1:204352680806:secret:dvly/idv/persona/apikey-lwVEYE';
     const personaDomain = (this.node.tryGetContext('personaDomain') as string | undefined) ?? 'withpersona.com';
     const personaInquiryTemplateId = this.node.tryGetContext('personaInquiryTemplateId') as string;
 
@@ -229,23 +274,19 @@ export class ApiStack extends cdk.Stack {
       logGroup: configureLogGroup,
       environment: {
         TENANT_TABLE:                  tenantTable.tableName,
-        PERSONA_API_KEY_SECRET_ARN:    personaApiKeySecretArn,
+        PERSONA_API_KEY_SECRET_OCID:   personaApiKeySecretOcid,
         PERSONA_DOMAIN:                personaDomain,
         PERSONA_INQUIRY_TEMPLATE_ID:   personaInquiryTemplateId,
-        EVENTBRIDGE_AWS_ACCOUNT_ID:    '223778538359',
-        EVENTBRIDGE_AWS_REGION:        'us-east-1',
+        EVENTBRIDGE_AWS_ACCOUNT_ID:    this.account,
+        EVENTBRIDGE_AWS_REGION:        this.region,
+        ...ociEnv,
       },
-      bundling: { externalModules: ['@aws-sdk/*'], minify: true },
+      layers: [ociSecretsLayer],
+      bundling: { externalModules: ['@aws-sdk/*', 'dvly-oci-secrets'], minify: true },
     });
 
     tenantTable.grantWriteData(configureFn);
-    configureFn.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['secretsmanager:GetSecretValue'],
-      resources: [
-        `arn:aws:secretsmanager:${this.region}:${this.account}:secret:auth0/tenants/*`,
-        personaApiKeySecretArn,
-      ],
-    }));
+    grantOciKeyRead(configureFn);
 
     new events.Rule(this, 'TenantProvisionedRule', {
       eventPattern: {
@@ -271,7 +312,8 @@ export class ApiStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(30),
       memorySize: 512,
       logGroup: mcpLogGroup,
-      environment: { TENANT_TABLE: tenantTable.tableName },
+      environment: { TENANT_TABLE: tenantTable.tableName, ...ociEnv },
+      layers: [ociSecretsLayer],
       // ESM output (not the default CJS) — @auth0/auth0-mcp-server's analytics
       // util uses createRequire(import.meta.url) to load its package.json;
       // esbuild's CJS shim for import.meta.url resolves to undefined, which
@@ -286,7 +328,7 @@ export class ApiStack extends cdk.Stack {
       // relative path. Installing it as a real node_modules package keeps
       // its internal directory layout (and that lookup) intact.
       bundling: {
-        externalModules: ['@aws-sdk/*'],
+        externalModules: ['@aws-sdk/*', 'dvly-oci-secrets'],
         nodeModules: ['@auth0/auth0-mcp-server'],
         minify: true,
         format: OutputFormat.ESM,
@@ -295,22 +337,12 @@ export class ApiStack extends cdk.Stack {
     });
 
     tenantTable.grantReadData(mcpFn);
-    mcpFn.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['secretsmanager:GetSecretValue'],
-      resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:auth0/tenants/*`],
-    }));
+    grantOciKeyRead(mcpFn);
 
-    // Read the Teams API key at runtime (never in env vars or CloudFormation)
-    provisionFn.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['secretsmanager:GetSecretValue'],
-      resources: [teamsApiKeySecretArn],
-    }));
-
-    // Write management_client credentials for each provisioned tenant
-    provisionFn.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['secretsmanager:CreateSecret', 'secretsmanager:TagResource'],
-      resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:auth0/tenants/*`],
-    }));
+    // The provisioner reads the Teams key from OCI Vault and writes each
+    // tenant's management_client credentials to OCI Vault too, so it only
+    // needs the SSM-stored OCI signing key.
+    grantOciKeyRead(provisionFn);
 
     const httpApi = new apigatewayv2.HttpApi(this, 'ReportingApi', {
       apiName: 'auth0-analytics-api',

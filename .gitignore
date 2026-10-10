@@ -7,3 +7,13 @@ dist/
 !jest.config.js
 .env
 *.local
+
+# Vendored Lambda layer: dvly-oci-secrets.
+# Lambda layers require the nodejs/node_modules/<pkg> layout, so re-include it
+# despite the global node_modules/ and *.js ignores above.
+!infrastructure/layers/
+!infrastructure/layers/oci-secrets/
+!infrastructure/layers/oci-secrets/nodejs/
+!infrastructure/layers/oci-secrets/nodejs/node_modules/
+!infrastructure/layers/oci-secrets/nodejs/node_modules/dvly-oci-secrets/
+!infrastructure/layers/oci-secrets/nodejs/node_modules/dvly-oci-secrets/**

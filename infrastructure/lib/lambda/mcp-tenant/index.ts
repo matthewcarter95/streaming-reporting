@@ -3,13 +3,43 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema, type CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { HANDLERS, getToolsForScopes } from '@auth0/auth0-mcp-server';
-import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
+import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { DynamoDBClient, GetItemCommand } from '@aws-sdk/client-dynamodb';
 
+// The OCI Vault reader comes from the dvly-oci-secrets Lambda layer and is
+// intentionally not bundled (see externalModules in apiStack.ts). This ESM
+// bundle gets a real `require` from the esbuild banner.
+interface OciSecretsModule {
+  configure(overrides: { privateKeyPem?: string }): void;
+  getSecretByName(name: string): Promise<string>;
+}
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const ociSecrets = require('dvly-oci-secrets') as OciSecretsModule;
+
 const region = process.env.AWS_REGION ?? 'us-east-1';
-const secretsClient = new SecretsManagerClient({ region });
 const dynamoClient = new DynamoDBClient({ region });
 const TENANT_TABLE = process.env.TENANT_TABLE ?? 'auth0-provisioned-tenants';
+const OCI_KEY_SSM_NAME = process.env.OCI_KEY_SSM_NAME!;
+
+// OCI secret name for a tenant's management_client credentials (see provision-tenant).
+const tenantSecretName = (tenantId: string) => `auth0.tenants.${tenantId}`;
+
+// Fetch the OCI signing key from SSM once per container and configure the layer.
+let _ociReady: Promise<void> | null = null;
+function initOci(): Promise<void> {
+  if (!_ociReady) {
+    _ociReady = (async () => {
+      const ssm = new SSMClient({ region });
+      const resp = await ssm.send(new GetParameterCommand({
+        Name: OCI_KEY_SSM_NAME,
+        WithDecryption: true,
+      }));
+      const privateKeyPem = Buffer.from(resp.Parameter?.Value ?? '', 'base64').toString('utf8');
+      ociSecrets.configure({ privateKeyPem });
+    })();
+  }
+  return _ociReady;
+}
 
 // Mirrors ELEVATED_SCOPES in provision-tenant/index.ts — every tenant's management
 // client is granted exactly this scope set, so tool availability is the same for all.
@@ -68,10 +98,9 @@ async function getTenantRecord(tenantId: string): Promise<TenantRecord | null> {
 }
 
 async function getManagementClientSecret(tenantId: string): Promise<ManagementClientSecret> {
-  const res = await secretsClient.send(new GetSecretValueCommand({
-    SecretId: `auth0/tenants/${tenantId}`,
-  }));
-  return JSON.parse(res.SecretString!) as ManagementClientSecret;
+  await initOci();
+  const value = await ociSecrets.getSecretByName(tenantSecretName(tenantId));
+  return JSON.parse(value) as ManagementClientSecret;
 }
 
 // Cached per warm Lambda instance, keyed by tenant — avoids a token exchange on every call.

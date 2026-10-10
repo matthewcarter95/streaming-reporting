@@ -1,27 +1,61 @@
 import { createRemoteJWKSet, jwtVerify, decodeJwt } from 'jose';
-import {
-  SecretsManagerClient,
-  CreateSecretCommand,
-  GetSecretValueCommand,
-} from '@aws-sdk/client-secrets-manager';
+import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { DynamoDBClient, PutItemCommand } from '@aws-sdk/client-dynamodb';
 import { EventBridgeClient, PutEventsCommand } from '@aws-sdk/client-eventbridge';
 
+// The OCI Vault reader/writer comes from the dvly-oci-secrets Lambda layer and
+// is intentionally not bundled (see externalModules in apiStack.ts).
+interface OciSecretsModule {
+  configure(overrides: { privateKeyPem?: string }): void;
+  getSecretByOcid(ocid: string): Promise<string>;
+  getSecretByName(name: string): Promise<string>;
+  createOrUpdateSecret(args: {
+    name: string;
+    value: string;
+    description?: string;
+    metadata?: Record<string, string>;
+  }): Promise<unknown>;
+}
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const ociSecrets = require('dvly-oci-secrets') as OciSecretsModule;
+
 const TRUSTED_ISSUERS        = (process.env.TRUSTED_ISSUERS ?? '').split(',').filter(Boolean);
 const TEAMS_SLUG              = process.env.TEAMS_SLUG!;
-const TEAMS_API_KEY_SECRET_ARN = process.env.TEAMS_API_KEY_SECRET_ARN!;
+const TEAMS_API_KEY_SECRET_OCID = process.env.TEAMS_API_KEY_SECRET_OCID!;
+const OCI_KEY_SSM_NAME        = process.env.OCI_KEY_SSM_NAME!;
 const DEFAULT_LOCALITY        = process.env.DEFAULT_LOCALITY ?? 'US-3';
 const TEAMS_BASE              = `https://${TEAMS_SLUG}.teams.auth0.com`;
 
-// Teams API requires admin_email to be an existing member of the team.
+// Auth0 Teams API requires admin_email to be an existing member of the team.
 // Phone-only signups have no email claim, so we use a fixed team admin for now.
 const TEAMS_ADMIN_EMAIL = 'matthew.keith.carter@gmail.com';
 
 const region = process.env.AWS_REGION ?? 'us-east-1';
-const secretsClient  = new SecretsManagerClient({ region });
 const dynamoClient   = new DynamoDBClient({ region });
 const ebClient       = new EventBridgeClient({ region });
 const TENANT_TABLE   = process.env.TENANT_TABLE ?? 'auth0-provisioned-tenants';
+
+// OCI secret name for a tenant's management_client credentials. OCI secret
+// names allow only [A-Za-z0-9._-], so we use dots instead of slashes.
+const TENANT_SECRET_PREFIX = 'auth0.tenants.';
+const tenantSecretName = (tenantId: string) => `${TENANT_SECRET_PREFIX}${tenantId}`;
+
+// Fetch the OCI signing key from SSM once per container and configure the layer.
+let _ociReady: Promise<void> | null = null;
+function initOci(): Promise<void> {
+  if (!_ociReady) {
+    _ociReady = (async () => {
+      const ssm = new SSMClient({ region });
+      const resp = await ssm.send(new GetParameterCommand({
+        Name: OCI_KEY_SSM_NAME,
+        WithDecryption: true,
+      }));
+      const privateKeyPem = Buffer.from(resp.Parameter?.Value ?? '', 'base64').toString('utf8');
+      ociSecrets.configure({ privateKeyPem });
+    })();
+  }
+  return _ociReady;
+}
 
 // Full scope list confirmed working against strategic-teams-poc1
 const ELEVATED_SCOPES = [
@@ -52,10 +86,8 @@ let cachedApiKey: string | null = null;
 
 async function getTeamsApiKey(): Promise<string> {
   if (cachedApiKey) return cachedApiKey;
-  const res = await secretsClient.send(new GetSecretValueCommand({
-    SecretId: TEAMS_API_KEY_SECRET_ARN,
-  }));
-  cachedApiKey = res.SecretString!;
+  await initOci();
+  cachedApiKey = await ociSecrets.getSecretByOcid(TEAMS_API_KEY_SECRET_OCID);
   return cachedApiKey;
 }
 
@@ -187,10 +219,11 @@ async function storeManagementClient(
   createdByEmail: string,
   createdByPhone?: string,
 ) {
-  await secretsClient.send(new CreateSecretCommand({
-    Name: `auth0/tenants/${tenantId}`,
-    Description: `Management API credentials for Auth0 tenant ${tenantName}`,
-    SecretString: JSON.stringify({
+  await initOci();
+  await ociSecrets.createOrUpdateSecret({
+    name: tenantSecretName(tenantId),
+    description: `Management API credentials for Auth0 tenant ${tenantName}`,
+    value: JSON.stringify({
       client_id:        mc.client_id,
       client_secret:    mc.client_secret,
       domain,
@@ -200,13 +233,13 @@ async function storeManagementClient(
       ...(createdByPhone ? { created_by_phone: createdByPhone } : {}),
       created_at:       new Date().toISOString(),
     }),
-    Tags: [
-      { Key: 'auth0-tenant-id',   Value: tenantId },
-      { Key: 'auth0-tenant-name', Value: tenantName },
-      // AWS tag values disallow '|' and other characters that can appear in Auth0 sub claims (e.g. "github|123")
-      { Key: 'created-by',        Value: createdBySub.replace(/[^\w\s.:/=+\-@]/g, '-') },
-    ],
-  }));
+    metadata: {
+      'auth0-tenant-id':   tenantId,
+      'auth0-tenant-name': tenantName,
+      // OCI freeform tag values disallow '|' and other characters that can appear in Auth0 sub claims (e.g. "github|123")
+      'created-by':        createdBySub.replace(/[^\w\s.:/=+\-@]/g, '-'),
+    },
+  });
 }
 
 function response(statusCode: number, body: unknown) {
