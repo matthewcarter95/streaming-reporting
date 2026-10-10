@@ -9,7 +9,7 @@ const app = new cdk.App();
 
 // Auth0 partner event buses exist in us-east-1; all stacks must deploy there
 const env = {
-  account: '204352680806',
+  account: '223778538359',
   region: 'us-east-1',
 };
 

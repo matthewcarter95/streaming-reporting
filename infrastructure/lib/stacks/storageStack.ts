@@ -2,6 +2,7 @@ import * as cdk from 'aws-cdk-lib';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as glue from 'aws-cdk-lib/aws-glue';
 import * as athena from 'aws-cdk-lib/aws-athena';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import { Construct } from 'constructs';
 
 export class StorageStack extends cdk.Stack {
@@ -9,6 +10,8 @@ export class StorageStack extends cdk.Stack {
   public readonly glueDatabase: glue.CfnDatabase;
   public readonly glueTable: glue.CfnTable;
   public readonly athenaWorkgroup: athena.CfnWorkGroup;
+  /** Maps a Dvly Solutions user (sub) to the Auth0 tenant slugs they own. */
+  public readonly tenantMappingTable: dynamodb.Table;
 
   constructor(scope: Construct, id: string, props: cdk.StackProps) {
     super(scope, id, props);
@@ -122,6 +125,23 @@ export class StorageStack extends cdk.Stack {
       },
     });
 
+    // ── Tenant-mapping table ──────────────────────────────────────────────────
+    // PK: userId  (Auth0 sub from ciam.dvlysolutions.com, e.g. "auth0|abc123")
+    // SK: tenantId (Auth0 tenant slug, e.g. "dvly-cust1")
+    //
+    // This is the authoritative source for which Auth0 tenants a Dvly Solutions
+    // user is allowed to query.  When the Auth0 Teams / Tenant API is available,
+    // a provisioning Lambda will keep this table in sync automatically.
+    this.tenantMappingTable = new dynamodb.Table(this, 'TenantMappingTable', {
+      tableName: 'dvly-user-tenant-map',
+      partitionKey: { name: 'userId', type: dynamodb.AttributeType.STRING },
+      sortKey:      { name: 'tenantId', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
     new cdk.CfnOutput(this, 'EventsBucketName', {
       value: this.eventsBucket.bucketName,
       exportName: 'Auth0Analytics-EventsBucketName',
@@ -135,6 +155,10 @@ export class StorageStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'AthenaWorkgroupName', {
       value: this.athenaWorkgroup.name,
       exportName: 'Auth0Analytics-AthenaWorkgroupName',
+    });
+    new cdk.CfnOutput(this, 'TenantMappingTableName', {
+      value: this.tenantMappingTable.tableName,
+      exportName: 'Auth0Analytics-TenantMappingTableName',
     });
   }
 }

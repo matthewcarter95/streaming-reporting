@@ -10,41 +10,85 @@ import {
 
 const athena = new AthenaClient({ region: process.env.AWS_REGION ?? 'us-east-1' });
 
-const DATABASE = process.env.ATHENA_DATABASE ?? 'auth0_events';
-const TABLE = process.env.ATHENA_TABLE ?? 'logs';
-const WORKGROUP = process.env.ATHENA_WORKGROUP ?? 'auth0-analytics';
+const DATABASE   = process.env.ATHENA_DATABASE ?? 'auth0_events';
+const TABLE      = process.env.ATHENA_TABLE ?? 'logs';
+const WORKGROUP  = process.env.ATHENA_WORKGROUP ?? 'auth0-analytics';
 const RESULTS_BUCKET = process.env.S3_RESULTS_BUCKET!;
-const TENANT_CLAIM = process.env.TENANT_CLAIM ?? 'org_id';
-const DEFAULT_TENANT = process.env.DEFAULT_TENANT ?? 'dev-cs5j6vau';
 
-// Tenant claim must be alphanumeric slugs only — validated before use in SQL
+// Only alphanumeric slugs and hyphens/underscores allowed in tenant names
+// (they appear directly in SQL WHERE clauses)
 const SAFE_TENANT_RE = /^[a-zA-Z0-9_-]+$/;
 
-interface RequestContext {
-  authorizer?: {
-    jwt?: {
-      claims?: Record<string, string>;
-    };
-  };
+// ── Event shape ───────────────────────────────────────────────────────────────
+
+interface AuthorizerContext {
+  /** Comma-separated list of tenantIds the authenticated user is allowed to query */
+  tenantIds?: string;
+  userId?: string;
 }
 
 interface LambdaEvent {
   rawPath?: string;
-  requestContext?: RequestContext;
+  requestContext?: {
+    authorizer?: {
+      lambda?: AuthorizerContext;    // Lambda authorizer (new path)
+      jwt?: { claims?: Record<string, string> }; // built-in JWT authorizer (legacy / test)
+    };
+  };
   queryStringParameters?: Record<string, string>;
 }
 
-function getTenantId(event: LambdaEvent): string {
-  // Lambda authorizer context (new path)
-  const lambdaCtx = (event.requestContext?.authorizer as Record<string, unknown> | undefined)?.lambda as Record<string, string> | undefined;
-  if (lambdaCtx?.tenantId && SAFE_TENANT_RE.test(lambdaCtx.tenantId)) return lambdaCtx.tenantId;
-  // Built-in JWT authorizer claims (legacy path, kept for direct invocation testing)
-  const claims = event.requestContext?.authorizer?.jwt?.claims;
-  const tenant = claims?.[TENANT_CLAIM] ?? claims?.['org_id'];
-  if (tenant && SAFE_TENANT_RE.test(tenant)) return tenant;
-  // Default — single-tenant mode
-  return DEFAULT_TENANT;
+// ── Tenant resolution ─────────────────────────────────────────────────────────
+
+/**
+ * Returns the set of tenant slugs the caller is allowed to query.
+ * Source of truth is the `tenantIds` string injected by the Lambda authorizer.
+ * Falls back to an empty array (which means 403) rather than a default tenant.
+ */
+function getAllowedTenants(event: LambdaEvent): string[] {
+  const lambdaCtx = event.requestContext?.authorizer?.lambda;
+  if (lambdaCtx?.tenantIds) {
+    return lambdaCtx.tenantIds.split(',').map(t => t.trim()).filter(t => SAFE_TENANT_RE.test(t));
+  }
+  return [];
 }
+
+/**
+ * Resolves the single tenant to query for this request.
+ *
+ * If the caller passes `?tenant=<slug>` it is validated against the allowed list.
+ * If no `?tenant=` is given and the user has exactly one mapped tenant, that is used.
+ * Otherwise we return a 400/403 error string (callers check `startsWith('ERROR:')`).
+ */
+function resolveTenant(event: LambdaEvent): { tenant: string } | { error: string; status: number } {
+  const allowed = getAllowedTenants(event);
+
+  if (allowed.length === 0) {
+    return { error: 'No tenant access configured for this user', status: 403 };
+  }
+
+  const requested = event.queryStringParameters?.tenant?.trim();
+
+  if (requested) {
+    if (!SAFE_TENANT_RE.test(requested)) {
+      return { error: 'Invalid tenant parameter', status: 400 };
+    }
+    if (!allowed.includes(requested)) {
+      return { error: `Access denied to tenant: ${requested}`, status: 403 };
+    }
+    return { tenant: requested };
+  }
+
+  // No ?tenant= param — use the single allowed tenant or require explicit selection
+  if (allowed.length === 1) return { tenant: allowed[0] };
+
+  return {
+    error: `Multiple tenants available; specify ?tenant= (one of: ${allowed.join(', ')})`,
+    status: 400,
+  };
+}
+
+// ── Athena helpers ────────────────────────────────────────────────────────────
 
 async function runQuery(sql: string): Promise<Record<string, string>[]> {
   const start = await athena.send(new StartQueryExecutionCommand({
@@ -89,6 +133,8 @@ function lastNDaysRange(n: number): { yearFrom: number; monthFrom: number; dayFr
   d.setDate(d.getDate() - n);
   return { yearFrom: d.getFullYear(), monthFrom: d.getMonth() + 1, dayFrom: d.getDate() };
 }
+
+// ── Report queries ────────────────────────────────────────────────────────────
 
 async function registrationsReport(tenant: string, days = 30): Promise<Record<string, string>[]> {
   const { yearFrom, monthFrom } = lastNDaysRange(days);
@@ -136,7 +182,7 @@ async function eventTypesReport(tenant: string, days = 30): Promise<Record<strin
 }
 
 async function activeUsersReport(tenant: string): Promise<Record<string, string>[]> {
-  const range7 = lastNDaysRange(7);
+  const range7  = lastNDaysRange(7);
   const range30 = lastNDaysRange(30);
   return runQuery(`
     SELECT
@@ -154,6 +200,8 @@ async function activeUsersReport(tenant: string): Promise<Record<string, string>
   `);
 }
 
+// ── Response helper ───────────────────────────────────────────────────────────
+
 function response(statusCode: number, body: unknown) {
   return {
     statusCode,
@@ -162,24 +210,31 @@ function response(statusCode: number, body: unknown) {
   };
 }
 
-export const handler = async (event: LambdaEvent) => {
-  const tenantId = getTenantId(event);
+// ── Handler ───────────────────────────────────────────────────────────────────
 
-  const days = parseInt(event.queryStringParameters?.days ?? '30', 10);
+export const handler = async (event: LambdaEvent) => {
+  const tenantResult = resolveTenant(event);
+
+  if ('error' in tenantResult) {
+    return response(tenantResult.status, { error: tenantResult.error });
+  }
+
+  const { tenant } = tenantResult;
+  const days = Math.min(Math.max(parseInt(event.queryStringParameters?.days ?? '30', 10), 1), 365);
   const path = event.rawPath ?? '';
 
   try {
     if (path.endsWith('/reports/registrations')) {
-      return response(200, { data: await registrationsReport(tenantId, days) });
+      return response(200, { tenant, data: await registrationsReport(tenant, days) });
     }
     if (path.endsWith('/reports/logins')) {
-      return response(200, { data: await loginsReport(tenantId, days) });
+      return response(200, { tenant, data: await loginsReport(tenant, days) });
     }
     if (path.endsWith('/reports/event-types')) {
-      return response(200, { data: await eventTypesReport(tenantId, days) });
+      return response(200, { tenant, data: await eventTypesReport(tenant, days) });
     }
     if (path.endsWith('/reports/active-users')) {
-      return response(200, { data: await activeUsersReport(tenantId) });
+      return response(200, { tenant, data: await activeUsersReport(tenant) });
     }
     return response(404, { error: 'Unknown report endpoint' });
   } catch (err) {
