@@ -32,7 +32,6 @@ TEAMS_SECRET_NAME="${TEAMS_SECRET_NAME:-streaming-reporting-teams-api-key}"
 PERSONA_SECRET_NAME="${PERSONA_SECRET_NAME:-streaming-reporting-persona-api-key}"
 
 command -v oci >/dev/null 2>&1 || { echo "ERROR: missing oci CLI"; exit 1; }
-command -v jq  >/dev/null 2>&1 || { echo "ERROR: missing jq"; exit 1; }
 
 read_value() {
   # read_value <env-var-name> <file-env-var-name>
@@ -73,7 +72,7 @@ upsert_secret() {
       --secret-name "${name}" \
       --description "${description}" \
       --secret-content-content "${b64}" \
-      --output json | jq -r '.data.id'
+      --query 'data.id' --raw-output
   fi
 }
 

@@ -189,7 +189,7 @@ export class ApiStack extends cdk.Stack {
       entry: path.join(__dirname, '../lambda/provision-tenant/index.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_22_X,
-      timeout: cdk.Duration.seconds(30),
+      timeout: cdk.Duration.seconds(60),
       memorySize: 256,
       logGroup: provisionerLogGroup,
       environment: {

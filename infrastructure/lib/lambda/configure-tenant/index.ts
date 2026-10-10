@@ -7,6 +7,7 @@ interface OciSecretsModule {
   configure(overrides: { privateKeyPem?: string }): void;
   getSecretByOcid(ocid: string): Promise<string>;
   getSecretByName(name: string): Promise<string>;
+  waitForSecretByName?(name: string): Promise<string>;
 }
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const ociSecrets = require('dvly-oci-secrets') as OciSecretsModule;
@@ -72,7 +73,12 @@ async function getPersonaApiKey(): Promise<string> {
 
 async function getManagementClient(tenantId: string): Promise<ManagementClientSecret> {
   await initOci();
-  const value = await ociSecrets.getSecretByName(tenantSecretName(tenantId));
+  const name = tenantSecretName(tenantId);
+  // The secret may still be CREATING when this event arrives (the provisioner
+  // writes it and emits the event synchronously), so poll for it to appear.
+  const value = ociSecrets.waitForSecretByName
+    ? await ociSecrets.waitForSecretByName(name)
+    : await ociSecrets.getSecretByName(name);
   return JSON.parse(value) as ManagementClientSecret;
 }
 

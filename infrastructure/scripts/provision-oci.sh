@@ -20,18 +20,21 @@ set -euo pipefail
 
 OCI_REGION="${OCI_REGION:-us-ashburn-1}"
 OCI_COMPARTMENT_OCID="${OCI_COMPARTMENT_OCID:-ocid1.compartment.oc1..aaaaaaaazssozixdqdrir4ynihqy45igxoxnsh4gssv3dexlnw5npu3464zq}"
+OCI_COMPARTMENT_NAME="${OCI_COMPARTMENT_NAME:-usps}"
 OCI_GROUP="${OCI_GROUP:-SecretsRetriever}"
 OCI_KEY_ID="${OCI_KEY_ID:-ocid1.key.oc1.iad.ejtifep6aahfs.abuwcljrrcg6wmk7uzbh36ojifr4pzoofoycytwg4fbt2e4jmp36ch42xuuq}"
 POLICY_NAME="${POLICY_NAME:-StreamingReportingSecrets}"
 
 command -v oci >/dev/null 2>&1 || { echo "ERROR: missing oci CLI"; exit 1; }
-command -v jq  >/dev/null 2>&1 || { echo "ERROR: missing jq"; exit 1; }
 
+# CreateSecret requires `use vaults` + `manage secrets`; encrypting the secret
+# requires `use keys` on the vault's master key. Reading needs `read secret-bundles`.
 STATEMENTS=$(cat <<JSON
 [
-  "Allow group ${OCI_GROUP} to read secret-bundles in compartment id ${OCI_COMPARTMENT_OCID}",
-  "Allow group ${OCI_GROUP} to manage secrets in compartment id ${OCI_COMPARTMENT_OCID}",
-  "Allow group ${OCI_GROUP} to use keys in compartment id ${OCI_COMPARTMENT_OCID} where target.key.id='${OCI_KEY_ID}'"
+  "Allow group ${OCI_GROUP} to read secret-bundles in compartment ${OCI_COMPARTMENT_NAME}",
+  "Allow group ${OCI_GROUP} to manage secrets in compartment ${OCI_COMPARTMENT_NAME}",
+  "Allow group ${OCI_GROUP} to use vaults in compartment ${OCI_COMPARTMENT_NAME}",
+  "Allow group ${OCI_GROUP} to use keys in compartment ${OCI_COMPARTMENT_NAME} where target.key.id='${OCI_KEY_ID}'"
 ]
 JSON
 )
@@ -56,9 +59,12 @@ if [[ -z "${POLICY_ID}" || "${POLICY_ID}" == "null" ]]; then
   echo "    created."
 else
   echo "==> Updating existing policy ${POLICY_NAME} (${POLICY_ID})"
+  VERSION_DATE=$(oci iam policy get --policy-id "${POLICY_ID}" \
+    --query 'data."version-date"' --raw-output)
   oci iam policy update \
     --policy-id "${POLICY_ID}" \
     --statements "${STATEMENTS}" \
+    --version-date "${VERSION_DATE}" \
     --force \
     --output json >/dev/null
   echo "    updated."
