@@ -21,18 +21,17 @@ export class ApiStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: ApiStackProps) {
     super(scope, id, props);
 
-    const { eventsBucket, athenaWorkgroup } = props.storageStack;
+    const { eventsBucket, athenaWorkgroup, tenantMappingTable } = props.storageStack;
 
     const auth0Domain = this.node.tryGetContext('auth0Domain') as string;
     const auth0Audience = this.node.tryGetContext('auth0Audience') as string;
-    const tenantClaim = (this.node.tryGetContext('tenantClaim') as string | undefined) ?? 'org_id';
+    const tenantClaim = (this.node.tryGetContext('tenantClaim') as string | undefined) ?? 'sub';
     const corsOrigins = ((this.node.tryGetContext('corsOrigins') as string | undefined) ?? '*').split(',');
-    const additionalIssuers = ((this.node.tryGetContext('additionalIssuers') as string | undefined) ?? '').split(',').filter(Boolean);
 
-    const trustedIssuers = [
-      `https://${auth0Domain}/`,
-      ...additionalIssuers,
-    ].join(',');
+    // The authorizer trusts tokens issued by the custom domain.
+    // Auth0 custom domains issue tokens whose `iss` is the custom domain, not
+    // the underlying tenant URL, so we only need the one issuer here.
+    const trustedIssuers = `https://${auth0Domain}/`;
 
     // Lambda authorizer — validates JWTs from any trusted issuer
     const authorizerLogGroup = new logs.LogGroup(this, 'AuthorizerLogGroup', {
@@ -51,12 +50,18 @@ export class ApiStack extends cdk.Stack {
       logGroup: authorizerLogGroup,
       environment: {
         TRUSTED_ISSUERS: trustedIssuers,
+        AUTH0_AUDIENCE: auth0Audience,
+        TENANT_MAPPING_TABLE: tenantMappingTable.tableName,
       },
       bundling: {
+        // jose and @aws-sdk/client-dynamodb must be bundled; NOT available in the runtime layer
         externalModules: [],
         minify: true,
       },
     });
+
+    // Grant the authorizer read access to the tenant-mapping table
+    tenantMappingTable.grantReadData(authorizerFn);
 
     const lambdaAuthorizer = new authorizers.HttpLambdaAuthorizer(
       'Auth0LambdaAuthorizer',
@@ -89,7 +94,6 @@ export class ApiStack extends cdk.Stack {
         ATHENA_WORKGROUP: athenaWorkgroup.name,
         S3_RESULTS_BUCKET: eventsBucket.bucketName,
         TENANT_CLAIM: tenantClaim,
-        DEFAULT_TENANT: auth0Domain.split('.')[0], // e.g. dev-cs5j6vau
       },
       bundling: {
         // @aws-sdk/* is available in the Lambda Node 20 runtime

@@ -9,10 +9,26 @@ import { Construct } from 'constructs';
 import * as path from 'path';
 import { StorageStack } from './storageStack';
 
-// Both Auth0 partner event bus ARNs in us-east-1
-const AUTH0_BUS_ARNS = [
-  'arn:aws:events:us-east-1:204352680806:event-bus/aws.partner/auth0.com/dev-cs5j6vau-b2e780c7-cb78-442f-85a4-cc73f39b97be/auth0.logs',
-  'arn:aws:events:us-east-1:204352680806:event-bus/aws.partner/auth0.com/usps-bcg-bdcb401f-f4b2-4eb0-9010-b206a9331a76/auth0.logs',
+// Auth0 partner event buses in us-east-1.
+//
+// Static tenants are always deployed.  Additional tenants can be injected at
+// deploy time via CDK context without touching source:
+//
+//   cdk deploy Auth0AnalyticsIngest \
+//     --context 'extraTenants=[{"label":"dvly-cust2","arn":"arn:aws:events:us-east-1:223778538359:event-bus/aws.partner/auth0.com/dvly-cust2-<uuid>/auth0.logs"}]'
+//
+// Or add them permanently to cdk.json under the "context" key:
+//   "extraTenants": [{ "label": "dvly-cust2", "arn": "arn:aws:events:..." }]
+interface TenantBus {
+  label: string;
+  arn: string;
+}
+
+const STATIC_BUS_ARNS: TenantBus[] = [
+  {
+    arn: 'arn:aws:events:us-east-1:223778538359:event-bus/aws.partner/auth0.com/dvly-cust1-fe2ce53a-2357-418a-af66-db7d56c2d09e/auth0.logs',
+    label: 'dvly-cust1',
+  },
 ];
 
 interface IngestStackProps extends cdk.StackProps {
@@ -106,13 +122,24 @@ export class IngestStack extends cdk.Stack {
       resources: [this.deliveryStream.attrArn],
     }));
 
-    // Add a new EventBridge rule on each Auth0 partner bus targeting the Firehose
-    AUTH0_BUS_ARNS.forEach((busArn, idx) => {
-      const tenantLabel = idx === 0 ? 'dev' : 'usps-bcg';
-      new events.CfnRule(this, `AnalyticsRule-${tenantLabel}`, {
-        name: `Auth0Analytics-${tenantLabel}`,
+    // Merge static tenants with any extras supplied via CDK context.
+    // Context value must be a JSON array: [{ "label": "...", "arn": "..." }]
+    const extraTenants: TenantBus[] = (() => {
+      const raw = this.node.tryGetContext('extraTenants');
+      if (!raw) return [];
+      const parsed: unknown = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!Array.isArray(parsed)) throw new Error('extraTenants context must be a JSON array');
+      return parsed as TenantBus[];
+    })();
+
+    const AUTH0_BUS_ARNS: TenantBus[] = [...STATIC_BUS_ARNS, ...extraTenants];
+
+    // Add an EventBridge rule on each Auth0 partner bus targeting the Firehose
+    AUTH0_BUS_ARNS.forEach(({ arn, label }) => {
+      new events.CfnRule(this, `AnalyticsRule-${label}`, {
+        name: `Auth0Analytics-${label}`,
         description: 'Routes Auth0 events to Firehose for analytics (added by CDK)',
-        eventBusName: busArn,
+        eventBusName: arn,
         eventPattern: {
           source: [{ prefix: 'aws.partner/auth0.com' }],
         },
