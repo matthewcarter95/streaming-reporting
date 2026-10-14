@@ -1,4 +1,4 @@
-import { decodeJwt } from 'jose';
+import { decodeJwt, createRemoteJWKSet, jwtVerify } from 'jose';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema, type CallToolResult } from '@modelcontextprotocol/sdk/types.js';
@@ -40,6 +40,15 @@ function initOci(): Promise<void> {
   }
   return _ociReady;
 }
+
+// Issuers trusted for the first-party (our own chatbot) path — same list the
+// shared authorizer uses. Any other verified issuer is treated as third-party
+// (a tenant's own Auth0 domain, reached via CIMD + enterprise federation).
+const TRUSTED_ISSUERS = (process.env.TRUSTED_ISSUERS ?? '').split(',').filter(Boolean);
+// Base URL of this API (e.g. https://xxxx.execute-api.us-east-1.amazonaws.com),
+// used to build the canonical MCP resource URI and protected-resource metadata URL.
+const API_BASE_URL = process.env.API_BASE_URL ?? '';
+const MCP_ADMIN_CLAIM = 'https://auth0-tenant-mcp/mcp_admin';
 
 // Mirrors ELEVATED_SCOPES in provision-tenant/index.ts — every tenant's management
 // client is granted exactly this scope set, so tool availability is the same for all.
@@ -166,6 +175,7 @@ interface ApiGatewayV2Event {
   headers?: Record<string, string>;
   body?: string;
   isBase64Encoded?: boolean;
+  requestContext?: { domainName?: string; http?: { method?: string } };
 }
 
 function extractBearerToken(headers: Record<string, string>): string | undefined {
@@ -174,34 +184,140 @@ function extractBearerToken(headers: Record<string, string>): string | undefined
   return match?.[1];
 }
 
+// Function URL events share API Gateway's v2 payload shape but carry no
+// pathParameters, so the tenantId is parsed from the raw path instead.
+const MCP_PATH_RE = /^\/(?:\.well-known\/oauth-protected-resource\/)?mcp\/([^/]+)\/?$/;
+const FUNCTION_URL_HOST_RE = /\.lambda-url\.[a-z0-9-]+\.on\.aws$/;
+
+// Can't be an env var: a function's env can't reference its own Function URL
+// (CloudFormation circular dependency), so derive it from the request.
+function baseUrlFor(event: ApiGatewayV2Event, isFunctionUrl: boolean): string {
+  return isFunctionUrl ? `https://${event.requestContext?.domainName}` : API_BASE_URL;
+}
+
+function wwwAuthenticateHeader(baseUrl: string, tenantId: string, error?: string): string {
+  const parts = ['Bearer'];
+  if (error) parts.push(`error="${error}"`);
+  parts.push(`resource_metadata="${baseUrl}/.well-known/oauth-protected-resource/mcp/${tenantId}"`);
+  return parts.join(' ');
+}
+
+const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+function getJwks(issuer: string) {
+  if (!jwksCache.has(issuer)) {
+    jwksCache.set(issuer, createRemoteJWKSet(new URL('.well-known/jwks.json', issuer)));
+  }
+  return jwksCache.get(issuer)!;
+}
+
 export const handler = async (event: ApiGatewayV2Event) => {
-  const tenantId = event.pathParameters?.['tenantId'];
+  const isFunctionUrl = FUNCTION_URL_HOST_RE.test(event.requestContext?.domainName ?? '');
+  const tenantId = event.pathParameters?.['tenantId'] ?? event.rawPath?.match(MCP_PATH_RE)?.[1];
   if (!tenantId) {
     return { statusCode: 400, body: JSON.stringify({ error: 'Missing tenantId path parameter' }) };
+  }
+  const baseUrl = baseUrlFor(event, isFunctionUrl);
+
+  // Protected Resource Metadata (RFC 9728) — unauthenticated, served regardless
+  // of the caller's token so OAuth/CIMD clients can discover the authorization
+  // server before they have any credential.
+  if (event.rawPath?.startsWith('/.well-known/oauth-protected-resource/')) {
+    const tenant = await getTenantRecord(tenantId);
+    if (!tenant?.domain) {
+      return { statusCode: 404, body: JSON.stringify({ error: 'Tenant not found' }) };
+    }
+    return {
+      statusCode: 200,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        resource: `${baseUrl}/mcp/${tenantId}`,
+        authorization_servers: [`https://${tenant.domain}/`],
+      }),
+    };
+  }
+
+  if (isFunctionUrl && event.requestContext?.http?.method !== 'POST') {
+    return { statusCode: 405, headers: { Allow: 'POST' }, body: JSON.stringify({ error: 'Method not allowed' }) };
   }
 
   const headers = event.headers ?? {};
   const bearerToken = extractBearerToken(headers);
   if (!bearerToken) {
-    return { statusCode: 401, body: JSON.stringify({ error: 'Missing Authorization header' }) };
+    return {
+      statusCode: 401,
+      headers: { 'WWW-Authenticate': wwwAuthenticateHeader(baseUrl, tenantId) },
+      body: JSON.stringify({ error: 'Missing Authorization header' }),
+    };
   }
 
-  let callerSub: string | undefined;
+  let claims: { sub?: string; iss?: string; aud?: string | string[]; [key: string]: unknown };
   try {
-    callerSub = decodeJwt(bearerToken).sub;
+    claims = decodeJwt(bearerToken);
   } catch {
-    return { statusCode: 401, body: JSON.stringify({ error: 'Invalid JWT' }) };
+    return {
+      statusCode: 401,
+      headers: { 'WWW-Authenticate': wwwAuthenticateHeader(baseUrl, tenantId, 'invalid_token') },
+      body: JSON.stringify({ error: 'Invalid JWT' }),
+    };
   }
 
-  // Signature/issuer verification already happened in the shared Lambda authorizer
-  // (Auth0LambdaAuthorizer) wired to this route in apiStack.ts — here we only need
-  // the already-trusted token's claims to check tenant ownership.
   const tenant = await getTenantRecord(tenantId);
   if (!tenant) {
     return { statusCode: 404, body: JSON.stringify({ error: 'Tenant not found' }) };
   }
-  if (!callerSub || tenant.created_by_sub !== callerSub) {
-    return { statusCode: 403, body: JSON.stringify({ error: 'Not authorized for this tenant' }) };
+
+  // Behind API Gateway the mcp-authorizer Lambda has already verified the token
+  // signature/issuer. The Function URL has no authorizer, so verify here against
+  // the tenant's own Auth0 issuer and this tenant's MCP resource audience.
+  // First-party (trusted-issuer) tokens are not accepted on this path — the
+  // chatbot goes through API Gateway.
+  if (isFunctionUrl) {
+    const tenantIssuer = `https://${tenant.domain}/`;
+    try {
+      await jwtVerify(bearerToken, getJwks(tenantIssuer), {
+        issuer: tenantIssuer,
+        audience: `${baseUrl}/mcp/${tenantId}`,
+      });
+    } catch (err) {
+      console.error('Function URL token verification failed:', (err as Error).message);
+      return {
+        statusCode: 401,
+        headers: { 'WWW-Authenticate': wwwAuthenticateHeader(baseUrl, tenantId, 'invalid_token') },
+        body: JSON.stringify({ error: 'Invalid token' }),
+      };
+    }
+  }
+
+  const isFirstParty = !!claims.iss && TRUSTED_ISSUERS.includes(claims.iss);
+  if (isFirstParty) {
+    // First-party (our chatbot): unchanged ownership check.
+    if (!claims.sub || tenant.created_by_sub !== claims.sub) {
+      return { statusCode: 403, body: JSON.stringify({ error: 'Not authorized for this tenant' }) };
+    }
+  } else {
+    // Third-party (e.g. Claude via CIMD + enterprise federation into the
+    // tenant's own Auth0): require the mcp_admin custom claim set by the
+    // post-login Action, and that the token was issued for this tenant's MCP
+    // resource server.
+    // The API identifier is the MCP URL itself: MCP clients send it as the
+    // RFC 8707 `resource` parameter, taken from our protected-resource metadata.
+    const resourceIdentifier = `${baseUrl}/mcp/${tenantId}`;
+    const aud = claims.aud;
+    const audMatches = Array.isArray(aud) ? aud.includes(resourceIdentifier) : aud === resourceIdentifier;
+    if (!audMatches || claims[MCP_ADMIN_CLAIM] !== true) {
+      console.warn('403 third-party token:', JSON.stringify({
+        audMatches,
+        expectedAud: resourceIdentifier,
+        aud,
+        hasMcpAdminClaim: claims[MCP_ADMIN_CLAIM] === true,
+        azp: claims['azp'],
+      }));
+      return {
+        statusCode: 403,
+        headers: { 'WWW-Authenticate': wwwAuthenticateHeader(baseUrl, tenantId, 'insufficient_scope') },
+        body: JSON.stringify({ error: 'Not authorized for this tenant' }),
+      };
+    }
   }
 
   let managementClient: ManagementClientSecret;

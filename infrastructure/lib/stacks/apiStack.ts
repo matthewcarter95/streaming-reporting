@@ -338,6 +338,45 @@ export class ApiStack extends cdk.Stack {
 
     tenantTable.grantReadData(mcpFn);
     grantOciKeyRead(mcpFn);
+    mcpFn.addEnvironment('TRUSTED_ISSUERS', trustedIssuers);
+
+    // Dedicated authorizer for /mcp/{tenantId} — additive, does not touch the
+    // shared Auth0LambdaAuthorizer used by /tenants and /reports. Trusts the
+    // same static issuer list first, then falls back to verifying against a
+    // tenant's own Auth0 domain (for 3rd-party MCP clients federated into that
+    // tenant via CIMD + enterprise connection).
+    const mcpAuthorizerLogGroup = new logs.LogGroup(this, 'McpAuthorizerLogGroup', {
+      logGroupName: '/aws/lambda/auth0-tenant-mcp-authorizer',
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const mcpAuthorizerFn = new NodejsFunction(this, 'McpAuthorizerFunction', {
+      functionName: 'auth0-tenant-mcp-authorizer',
+      entry: path.join(__dirname, '../lambda/mcp-authorizer/index.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_22_X,
+      timeout: cdk.Duration.seconds(10),
+      memorySize: 128,
+      logGroup: mcpAuthorizerLogGroup,
+      environment: {
+        TRUSTED_ISSUERS: trustedIssuers,
+        TENANT_TABLE: tenantTable.tableName,
+      },
+      bundling: { externalModules: ['@aws-sdk/*'], minify: true },
+    });
+    tenantTable.grantReadData(mcpAuthorizerFn);
+
+    const mcpLambdaAuthorizer = new authorizers.HttpLambdaAuthorizer(
+      'McpAuthorizer',
+      mcpAuthorizerFn,
+      {
+        authorizerName: 'auth0-mcp-multi-tenant',
+        responseTypes: [authorizers.HttpLambdaResponseType.SIMPLE],
+        resultsCacheTtl: cdk.Duration.seconds(300),
+        identitySource: ['$request.header.Authorization'],
+      },
+    );
 
     // The provisioner reads the Teams key from OCI Vault and writes each
     // tenant's management_client credentials to OCI Vault too, so it only
@@ -377,11 +416,49 @@ export class ApiStack extends cdk.Stack {
       authorizer: lambdaAuthorizer,
     });
 
+    const mcpIntegration = new integrations.HttpLambdaIntegration('TenantMcpIntegration', mcpFn);
+
     httpApi.addRoutes({
       path: '/mcp/{tenantId}',
       methods: [apigatewayv2.HttpMethod.POST],
-      integration: new integrations.HttpLambdaIntegration('TenantMcpIntegration', mcpFn),
-      authorizer: lambdaAuthorizer,
+      integration: mcpIntegration,
+      authorizer: mcpLambdaAuthorizer,
+    });
+
+    // Protected Resource Metadata (RFC 9728) — unauthenticated by design;
+    // OAuth/CIMD clients fetch this before they have any credential.
+    // Per the MCP spec's well-known URI convention, the resource path is
+    // APPENDED after /.well-known/oauth-protected-resource (not nested under
+    // the resource path) — e.g. a resource at /mcp/{tenantId} publishes its
+    // metadata at /.well-known/oauth-protected-resource/mcp/{tenantId}.
+    httpApi.addRoutes({
+      path: '/.well-known/oauth-protected-resource/mcp/{tenantId}',
+      methods: [apigatewayv2.HttpMethod.GET],
+      integration: mcpIntegration,
+    });
+
+    mcpFn.addEnvironment('API_BASE_URL', httpApi.apiEndpoint);
+
+    // Function URL for third-party MCP clients (e.g. Claude). API Gateway's
+    // Lambda authorizer rejects a missing Authorization header with a bare 401
+    // before any code runs, so it can never emit the WWW-Authenticate header
+    // that OAuth discovery (RFC 9728) depends on. The Function URL has no
+    // authorizer: the Lambda itself returns the 401 + WWW-Authenticate and
+    // verifies the JWT. The first-party chatbot keeps using /mcp/{tenantId}
+    // through API Gateway.
+    const mcpFnUrl = mcpFn.addFunctionUrl({
+      authType: lambda.FunctionUrlAuthType.NONE,
+      cors: {
+        allowedOrigins: ['*'],
+        allowedMethods: [lambda.HttpMethod.GET, lambda.HttpMethod.POST],
+        allowedHeaders: ['Authorization', 'Content-Type', 'Accept', 'Mcp-Protocol-Version'],
+        exposedHeaders: ['WWW-Authenticate'],
+      },
+    });
+
+    new cdk.CfnOutput(this, 'TenantMcpFunctionUrl', {
+      value: mcpFnUrl.url,
+      description: 'MCP endpoint for 3rd-party clients: <url>mcp/{tenantId}',
     });
 
     new cdk.CfnOutput(this, 'TenantProvisionerFunctionArn', {
