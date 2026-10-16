@@ -6,6 +6,9 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as apigatewayv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import * as integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import * as authorizers from 'aws-cdk-lib/aws-apigatewayv2-authorizers';
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { NodejsFunction, OutputFormat } from 'aws-cdk-lib/aws-lambda-nodejs';
@@ -27,6 +30,24 @@ export class ApiStack extends cdk.Stack {
     const auth0Audience = this.node.tryGetContext('auth0Audience') as string;
     const tenantClaim = (this.node.tryGetContext('tenantClaim') as string | undefined) ?? 'sub';
     const corsOrigins = ((this.node.tryGetContext('corsOrigins') as string | undefined) ?? '*').split(',');
+
+    // ── MCP public endpoint ────────────────────────────────────────────────────
+    // The tenant MCP server is published on a stable custom domain so that the
+    // per-tenant OAuth resource identifier (and the protected-resource metadata
+    // URL that third-party agents discover) is a clean, permanent URL rather
+    // than the raw execute-api endpoint.
+    const mcpDomainName      = (this.node.tryGetContext('mcpDomainName')      as string | undefined) ?? 'ciam-mcp.dvlysolutions.com';
+    const mcpHostedZoneId    = (this.node.tryGetContext('mcpHostedZoneId')    as string | undefined) ?? 'Z01308961Z6O5C3EZ6GNV';
+    const mcpHostedZoneName  = (this.node.tryGetContext('mcpHostedZoneName')  as string | undefined) ?? 'dvlysolutions.com';
+    const mcpBaseUrl         = `https://${mcpDomainName}`;
+
+    // Third-party MCP client (Claude) is registered by importing its CIMD URL.
+    const claudeCimdUrl      = (this.node.tryGetContext('claudeCimdUrl') as string | undefined) ?? 'https://claude.ai/oauth/mcp-oauth-client-metadata';
+
+    // Enterprise OIDC connector: the tenant federates to our own ciam tenant.
+    const ciamOidcDiscoveryUrl    = (this.node.tryGetContext('ciamOidcDiscoveryUrl')    as string | undefined) ?? 'https://ciam.dvlysolutions.com/.well-known/openid-configuration';
+    const ciamOidcClientId        = (this.node.tryGetContext('ciamOidcClientId')        as string | undefined) ?? '';
+    const ciamOidcClientSecretOcid = (this.node.tryGetContext('ciamOidcClientSecretOcid') as string | undefined) ?? '';
 
     // The authorizer trusts tokens issued by the custom domain.
     // Auth0 custom domains issue tokens whose `iss` is the custom domain, not
@@ -176,7 +197,8 @@ export class ApiStack extends cdk.Stack {
     eventsBucket.grantPut(reportingFn, 'athena-results/*');
 
     const teamsSlug           = (this.node.tryGetContext('teamsSlug')          as string | undefined) ?? '';
-    const defaultLocality     = (this.node.tryGetContext('defaultLocality')    as string | undefined) ?? 'US-3';
+    const defaultLocality     = (this.node.tryGetContext('defaultLocality')    as string | undefined) ?? 'us';
+    const trustedProxySubs    = (this.node.tryGetContext('trustedProxySubs')   as string | undefined) ?? '';
 
     const provisionerLogGroup = new logs.LogGroup(this, 'ProvisionerLogGroup', {
       logGroupName: '/aws/lambda/auth0-tenant-provisioner',
@@ -197,6 +219,8 @@ export class ApiStack extends cdk.Stack {
         TEAMS_SLUG:                 teamsSlug,
         TEAMS_API_KEY_SECRET_OCID:  teamsApiKeySecretOcid,
         DEFAULT_LOCALITY:           defaultLocality,
+        TRUSTED_PROXY_SUBS:         trustedProxySubs,
+        TENANT_MAP_TABLE:           tenantMappingTable.tableName,
         ...ociEnv,
       },
       layers: [ociSecretsLayer],
@@ -231,6 +255,9 @@ export class ApiStack extends cdk.Stack {
       resources: [`arn:aws:events:${this.region}:${this.account}:event-bus/default`],
     }));
     provisionFn.addEnvironment('TENANT_TABLE', tenantTable.tableName);
+    provisionFn.addEnvironment('TENANT_MAP_TABLE', tenantMappingTable.tableName);
+    // The provisioner records ownership (userId -> tenantId) when it creates a tenant
+    tenantMappingTable.grantWriteData(provisionFn);
 
     // Status Lambda
     const statusLogGroup = new logs.LogGroup(this, 'StatusLogGroup', {
@@ -279,6 +306,12 @@ export class ApiStack extends cdk.Stack {
         PERSONA_INQUIRY_TEMPLATE_ID:   personaInquiryTemplateId,
         EVENTBRIDGE_AWS_ACCOUNT_ID:    this.account,
         EVENTBRIDGE_AWS_REGION:        this.region,
+        // MCP / third-party federation config (see configure-tenant/index.ts).
+        MCP_RESOURCE_BASE_URL:         mcpBaseUrl,
+        CLAUDE_CIMD_URL:               claudeCimdUrl,
+        CIAM_OIDC_DISCOVERY_URL:       ciamOidcDiscoveryUrl,
+        CIAM_OIDC_CLIENT_ID:           ciamOidcClientId,
+        CIAM_OIDC_CLIENT_SECRET_OCID:  ciamOidcClientSecretOcid,
         ...ociEnv,
       },
       layers: [ociSecretsLayer],
@@ -312,7 +345,11 @@ export class ApiStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(30),
       memorySize: 512,
       logGroup: mcpLogGroup,
-      environment: { TENANT_TABLE: tenantTable.tableName, ...ociEnv },
+      environment: {
+        TENANT_TABLE: tenantTable.tableName,
+        TRUSTED_PROXY_SUBS: trustedProxySubs,
+        ...ociEnv,
+      },
       layers: [ociSecretsLayer],
       // ESM output (not the default CJS) — @auth0/auth0-mcp-server's analytics
       // util uses createRequire(import.meta.url) to load its package.json;
@@ -339,44 +376,16 @@ export class ApiStack extends cdk.Stack {
     tenantTable.grantReadData(mcpFn);
     grantOciKeyRead(mcpFn);
     mcpFn.addEnvironment('TRUSTED_ISSUERS', trustedIssuers);
+    // Third-party calls are authorized against the assignment table.
+    mcpFn.addEnvironment('TENANT_MAP_TABLE', tenantMappingTable.tableName);
+    tenantMappingTable.grantReadData(mcpFn);
 
-    // Dedicated authorizer for /mcp/{tenantId} — additive, does not touch the
-    // shared Auth0LambdaAuthorizer used by /tenants and /reports. Trusts the
-    // same static issuer list first, then falls back to verifying against a
-    // tenant's own Auth0 domain (for 3rd-party MCP clients federated into that
-    // tenant via CIMD + enterprise connection).
-    const mcpAuthorizerLogGroup = new logs.LogGroup(this, 'McpAuthorizerLogGroup', {
-      logGroupName: '/aws/lambda/auth0-tenant-mcp-authorizer',
-      retention: logs.RetentionDays.ONE_WEEK,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-    });
-
-    const mcpAuthorizerFn = new NodejsFunction(this, 'McpAuthorizerFunction', {
-      functionName: 'auth0-tenant-mcp-authorizer',
-      entry: path.join(__dirname, '../lambda/mcp-authorizer/index.ts'),
-      handler: 'handler',
-      runtime: lambda.Runtime.NODEJS_22_X,
-      timeout: cdk.Duration.seconds(10),
-      memorySize: 128,
-      logGroup: mcpAuthorizerLogGroup,
-      environment: {
-        TRUSTED_ISSUERS: trustedIssuers,
-        TENANT_TABLE: tenantTable.tableName,
-      },
-      bundling: { externalModules: ['@aws-sdk/*'], minify: true },
-    });
-    tenantTable.grantReadData(mcpAuthorizerFn);
-
-    const mcpLambdaAuthorizer = new authorizers.HttpLambdaAuthorizer(
-      'McpAuthorizer',
-      mcpAuthorizerFn,
-      {
-        authorizerName: 'auth0-mcp-multi-tenant',
-        responseTypes: [authorizers.HttpLambdaResponseType.SIMPLE],
-        resultsCacheTtl: cdk.Duration.seconds(300),
-        identitySource: ['$request.header.Authorization'],
-      },
-    );
+    // No Lambda authorizer on /mcp/{tenantId}: API Gateway authorizers return
+    // their own bare 401 whenever the Authorization header is missing, which
+    // pre-empts the RFC 9728 WWW-Authenticate/resource_metadata challenge that
+    // OAuth discovery needs. The mcp-tenant Lambda verifies JWTs itself
+    // (trusted issuers first, then the tenant's own Auth0 domain for
+    // third-party clients) so a single endpoint serves both flows.
 
     // The provisioner reads the Teams key from OCI Vault and writes each
     // tenant's management_client credentials to OCI Vault too, so it only
@@ -388,7 +397,7 @@ export class ApiStack extends cdk.Stack {
       corsPreflight: {
         allowOrigins: corsOrigins,
         allowMethods: [apigatewayv2.CorsHttpMethod.GET, apigatewayv2.CorsHttpMethod.POST, apigatewayv2.CorsHttpMethod.OPTIONS],
-        allowHeaders: ['Authorization', 'Content-Type'],
+        allowHeaders: ['Authorization', 'Content-Type', 'X-Auth0-Sub', 'X-Auth0-Email'],
         maxAge: cdk.Duration.hours(1),
       },
     });
@@ -422,7 +431,6 @@ export class ApiStack extends cdk.Stack {
       path: '/mcp/{tenantId}',
       methods: [apigatewayv2.HttpMethod.POST],
       integration: mcpIntegration,
-      authorizer: mcpLambdaAuthorizer,
     });
 
     // Protected Resource Metadata (RFC 9728) — unauthenticated by design;
@@ -437,29 +445,53 @@ export class ApiStack extends cdk.Stack {
       integration: mcpIntegration,
     });
 
-    mcpFn.addEnvironment('API_BASE_URL', httpApi.apiEndpoint);
-
-    // Function URL for third-party MCP clients (e.g. Claude). API Gateway's
-    // Lambda authorizer rejects a missing Authorization header with a bare 401
-    // before any code runs, so it can never emit the WWW-Authenticate header
-    // that OAuth discovery (RFC 9728) depends on. The Function URL has no
-    // authorizer: the Lambda itself returns the 401 + WWW-Authenticate and
-    // verifies the JWT. The first-party chatbot keeps using /mcp/{tenantId}
-    // through API Gateway.
-    const mcpFnUrl = mcpFn.addFunctionUrl({
-      authType: lambda.FunctionUrlAuthType.NONE,
-      cors: {
-        allowedOrigins: ['*'],
-        allowedMethods: [lambda.HttpMethod.GET, lambda.HttpMethod.POST],
-        allowedHeaders: ['Authorization', 'Content-Type', 'Accept', 'Mcp-Protocol-Version'],
-        exposedHeaders: ['WWW-Authenticate'],
-      },
+    // Public custom domain for the MCP server. The resource identifier baked
+    // into each tenant's resource server is `${mcpBaseUrl}/mcp/{tenantId}`, so
+    // this must be stable — changing it invalidates every tenant's resource server.
+    const mcpHostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'McpHostedZone', {
+      hostedZoneId: mcpHostedZoneId,
+      zoneName:     mcpHostedZoneName,
     });
 
-    new cdk.CfnOutput(this, 'TenantMcpFunctionUrl', {
-      value: mcpFnUrl.url,
-      description: 'MCP endpoint for 3rd-party clients: <url>mcp/{tenantId}',
+    const mcpCertificate = new acm.Certificate(this, 'McpCertificate', {
+      domainName: mcpDomainName,
+      validation: acm.CertificateValidation.fromDns(mcpHostedZone),
     });
+
+    const mcpDomain = new apigatewayv2.DomainName(this, 'McpDomainName', {
+      domainName:  mcpDomainName,
+      certificate: mcpCertificate,
+    });
+
+    // Map the domain to the HttpApi's $default stage (all routes, incl. the
+    // unauthenticated /.well-known/oauth-protected-resource path).
+    new apigatewayv2.ApiMapping(this, 'McpApiMapping', {
+      api:        httpApi,
+      domainName: mcpDomain,
+    });
+
+    new route53.ARecord(this, 'McpDomainAliasRecord', {
+      zone:       mcpHostedZone,
+      recordName: mcpDomainName,
+      target:     route53.RecordTarget.fromAlias(
+        new route53Targets.ApiGatewayv2DomainProperties(mcpDomain.regionalDomainName, mcpDomain.regionalHostedZoneId),
+      ),
+    });
+
+    mcpFn.addEnvironment('API_BASE_URL', mcpBaseUrl);
+
+    new cdk.CfnOutput(this, 'McpResourceBaseUrl', {
+      value:       mcpBaseUrl,
+      description: 'Public base URL for the tenant MCP server (resource identifier prefix)',
+      exportName:  'Auth0Analytics-McpResourceBaseUrl',
+    });
+
+    // Both first-party (chatbot) and third-party (agent) traffic use a single
+    // endpoint: /mcp/{tenantId} through API Gateway. The authorizer lets
+    // token-less requests through so the Lambda can emit the RFC 9728 401 +
+    // WWW-Authenticate challenge that OAuth discovery depends on; real tokens
+    // are still verified here (trusted issuers first, then the tenant's own
+    // Auth0 domain for third-party clients).
 
     new cdk.CfnOutput(this, 'TenantProvisionerFunctionArn', {
       value: provisionFn.functionArn,

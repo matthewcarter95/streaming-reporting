@@ -19,7 +19,20 @@ const ociSecrets = require('dvly-oci-secrets') as OciSecretsModule;
 const region = process.env.AWS_REGION ?? 'us-east-1';
 const dynamoClient = new DynamoDBClient({ region });
 const TENANT_TABLE = process.env.TENANT_TABLE ?? 'auth0-provisioned-tenants';
+// Assignment table: userId (Auth0 sub) -> tenantId. Authoritative source of who
+// may operate on a given tenant (see configure-tenant / provision-tenant).
+const TENANT_MAP_TABLE = process.env.TENANT_MAP_TABLE ?? 'dvly-user-tenant-map';
 const OCI_KEY_SSM_NAME = process.env.OCI_KEY_SSM_NAME!;
+
+// Trusted proxies (e.g. the chatbot backend) may call the MCP server on behalf of
+// an authenticated end-user, passing that user's Auth0 sub via X-Auth0-Sub. Only
+// honored when the *verified token* belongs to a configured trusted proxy sub —
+// an ordinary caller's header is ignored and they are attributed from their own
+// token. Mirrors provision-tenant/index.ts.
+const TRUSTED_PROXY_SUBS = (process.env.TRUSTED_PROXY_SUBS ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 // OCI secret name for a tenant's management_client credentials (see provision-tenant).
 const tenantSecretName = (tenantId: string) => `auth0.tenants.${tenantId}`;
@@ -48,12 +61,11 @@ const TRUSTED_ISSUERS = (process.env.TRUSTED_ISSUERS ?? '').split(',').filter(Bo
 // Base URL of this API (e.g. https://xxxx.execute-api.us-east-1.amazonaws.com),
 // used to build the canonical MCP resource URI and protected-resource metadata URL.
 const API_BASE_URL = process.env.API_BASE_URL ?? '';
-const MCP_ADMIN_CLAIM = 'https://auth0-tenant-mcp/mcp_admin';
 
 // Mirrors ELEVATED_SCOPES in provision-tenant/index.ts — every tenant's management
 // client is granted exactly this scope set, so tool availability is the same for all.
 const ELEVATED_SCOPES = [
-  'read:client_grants', 'update:client_grants',
+  'read:client_grants', 'create:client_grants', 'update:client_grants',
   'read:clients', 'create:clients', 'update:clients', 'delete:clients',
   'read:client_keys', 'create:client_keys', 'update:client_keys',
   'read:connections', 'create:connections', 'update:connections', 'delete:connections',
@@ -104,6 +116,26 @@ async function getTenantRecord(tenantId: string): Promise<TenantRecord | null> {
     created_by_sub: res.Item['created_by_sub']?.S,
     domain: res.Item['domain']?.S,
   };
+}
+
+// A user authenticated into the tenant through our shared ciam enterprise
+// connection gets a tenant-local `sub` of the form
+//   oidc|<connection>|<ciam_sub>   e.g. oidc|dvly-solutions|auth0|6aa0...
+// We authorize against the *upstream* ciam identity (auth0|6aa0...), which is
+// what the assignment table stores. Anything without that prefix is treated as
+// its own identity (e.g. a native tenant user), which the table then decides on.
+function upstreamSub(sub: string | undefined): string | undefined {
+  if (!sub) return undefined;
+  const m = sub.match(/^oidc\|[^|]+\|(.+)$/);
+  return m ? m[1] : sub;
+}
+
+async function isUserAssignedToTenant(userId: string, tenantId: string): Promise<boolean> {
+  const res = await dynamoClient.send(new GetItemCommand({
+    TableName: TENANT_MAP_TABLE,
+    Key: { userId: { S: userId }, tenantId: { S: tenantId } },
+  }));
+  return !!res.Item;
 }
 
 async function getManagementClientSecret(tenantId: string): Promise<ManagementClientSecret> {
@@ -184,17 +216,6 @@ function extractBearerToken(headers: Record<string, string>): string | undefined
   return match?.[1];
 }
 
-// Function URL events share API Gateway's v2 payload shape but carry no
-// pathParameters, so the tenantId is parsed from the raw path instead.
-const MCP_PATH_RE = /^\/(?:\.well-known\/oauth-protected-resource\/)?mcp\/([^/]+)\/?$/;
-const FUNCTION_URL_HOST_RE = /\.lambda-url\.[a-z0-9-]+\.on\.aws$/;
-
-// Can't be an env var: a function's env can't reference its own Function URL
-// (CloudFormation circular dependency), so derive it from the request.
-function baseUrlFor(event: ApiGatewayV2Event, isFunctionUrl: boolean): string {
-  return isFunctionUrl ? `https://${event.requestContext?.domainName}` : API_BASE_URL;
-}
-
 function wwwAuthenticateHeader(baseUrl: string, tenantId: string, error?: string): string {
   const parts = ['Bearer'];
   if (error) parts.push(`error="${error}"`);
@@ -202,6 +223,7 @@ function wwwAuthenticateHeader(baseUrl: string, tenantId: string, error?: string
   return parts.join(' ');
 }
 
+// JWKS sets are cached per issuer across warm Lambda invocations.
 const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 function getJwks(issuer: string) {
   if (!jwksCache.has(issuer)) {
@@ -211,12 +233,11 @@ function getJwks(issuer: string) {
 }
 
 export const handler = async (event: ApiGatewayV2Event) => {
-  const isFunctionUrl = FUNCTION_URL_HOST_RE.test(event.requestContext?.domainName ?? '');
-  const tenantId = event.pathParameters?.['tenantId'] ?? event.rawPath?.match(MCP_PATH_RE)?.[1];
+  const tenantId = event.pathParameters?.['tenantId'];
   if (!tenantId) {
     return { statusCode: 400, body: JSON.stringify({ error: 'Missing tenantId path parameter' }) };
   }
-  const baseUrl = baseUrlFor(event, isFunctionUrl);
+  const baseUrl = API_BASE_URL;
 
   // Protected Resource Metadata (RFC 9728) — unauthenticated, served regardless
   // of the caller's token so OAuth/CIMD clients can discover the authorization
@@ -234,10 +255,6 @@ export const handler = async (event: ApiGatewayV2Event) => {
         authorization_servers: [`https://${tenant.domain}/`],
       }),
     };
-  }
-
-  if (isFunctionUrl && event.requestContext?.http?.method !== 'POST') {
-    return { statusCode: 405, headers: { Allow: 'POST' }, body: JSON.stringify({ error: 'Method not allowed' }) };
   }
 
   const headers = event.headers ?? {};
@@ -266,50 +283,65 @@ export const handler = async (event: ApiGatewayV2Event) => {
     return { statusCode: 404, body: JSON.stringify({ error: 'Tenant not found' }) };
   }
 
-  // Behind API Gateway the mcp-authorizer Lambda has already verified the token
-  // signature/issuer. The Function URL has no authorizer, so verify here against
-  // the tenant's own Auth0 issuer and this tenant's MCP resource audience.
-  // First-party (trusted-issuer) tokens are not accepted on this path — the
-  // chatbot goes through API Gateway.
-  if (isFunctionUrl) {
-    const tenantIssuer = `https://${tenant.domain}/`;
+  // No API Gateway authorizer sits in front of this route, so the JWT is
+  // verified here. First-party tokens (our chatbot) are checked against the
+  // shared trusted-issuer list; anything else is treated as third-party and
+  // verified against the target tenant's own Auth0 domain.
+  const isFirstParty = !!claims.iss && TRUSTED_ISSUERS.includes(claims.iss);
+  if (isFirstParty) {
     try {
-      await jwtVerify(bearerToken, getJwks(tenantIssuer), {
-        issuer: tenantIssuer,
-        audience: `${baseUrl}/mcp/${tenantId}`,
-      });
+      await jwtVerify(bearerToken, getJwks(claims.iss!), { issuer: claims.iss });
     } catch (err) {
-      console.error('Function URL token verification failed:', (err as Error).message);
+      console.error('First-party token verification failed:', (err as Error).message);
       return {
         statusCode: 401,
         headers: { 'WWW-Authenticate': wwwAuthenticateHeader(baseUrl, tenantId, 'invalid_token') },
         body: JSON.stringify({ error: 'Invalid token' }),
       };
     }
-  }
-
-  const isFirstParty = !!claims.iss && TRUSTED_ISSUERS.includes(claims.iss);
-  if (isFirstParty) {
-    // First-party (our chatbot): unchanged ownership check.
-    if (!claims.sub || tenant.created_by_sub !== claims.sub) {
+    // The caller may be a trusted proxy (e.g. the chatbot's M2M client) acting
+    // on behalf of an end-user via X-Auth0-Sub. Only honored when the verified
+    // token's own sub is a configured trusted proxy — otherwise the header is
+    // ignored (see TRUSTED_PROXY_SUBS above).
+    const headerSub = headers['x-auth0-sub'] ?? headers['X-Auth0-Sub'];
+    const delegated = !!(headerSub && claims.sub && TRUSTED_PROXY_SUBS.includes(claims.sub));
+    const effectiveSub = delegated ? headerSub : claims.sub;
+    if (delegated) {
+      console.log(`[mcp] trusted proxy ${claims.sub} acting on behalf of ${effectiveSub}`);
+    }
+    if (!effectiveSub || tenant.created_by_sub !== effectiveSub) {
       return { statusCode: 403, body: JSON.stringify({ error: 'Not authorized for this tenant' }) };
     }
   } else {
     // Third-party (e.g. Claude via CIMD + enterprise federation into the
-    // tenant's own Auth0): require the mcp_admin custom claim set by the
-    // post-login Action, and that the token was issued for this tenant's MCP
-    // resource server.
-    // The API identifier is the MCP URL itself: MCP clients send it as the
-    // RFC 8707 `resource` parameter, taken from our protected-resource metadata.
+    // tenant's own Auth0): verify against the tenant's issuer with the MCP URL
+    // as audience — the RFC 8707 `resource` value clients take from our
+    // protected-resource metadata. Authorization is by assignment: the
+    // authenticated user (mapped back to their ciam identity) must be assigned
+    // to this tenant in the assignment table. We deliberately do NOT gate on
+    // resource-server scopes — every user of the shared ciam IdP could obtain
+    // them, whereas assignment is per-tenant.
+    const tenantIssuer = `https://${tenant.domain}/`;
     const resourceIdentifier = `${baseUrl}/mcp/${tenantId}`;
-    const aud = claims.aud;
-    const audMatches = Array.isArray(aud) ? aud.includes(resourceIdentifier) : aud === resourceIdentifier;
-    if (!audMatches || claims[MCP_ADMIN_CLAIM] !== true) {
-      console.warn('403 third-party token:', JSON.stringify({
-        audMatches,
-        expectedAud: resourceIdentifier,
-        aud,
-        hasMcpAdminClaim: claims[MCP_ADMIN_CLAIM] === true,
+    try {
+      await jwtVerify(bearerToken, getJwks(tenantIssuer), {
+        issuer: tenantIssuer,
+        audience: resourceIdentifier,
+      });
+    } catch (err) {
+      console.error('Third-party token verification failed:', (err as Error).message);
+      return {
+        statusCode: 401,
+        headers: { 'WWW-Authenticate': wwwAuthenticateHeader(baseUrl, tenantId, 'invalid_token') },
+        body: JSON.stringify({ error: 'Invalid token' }),
+      };
+    }
+    const identity = upstreamSub(claims.sub);
+    const assigned = identity ? await isUserAssignedToTenant(identity, tenantId) : false;
+    if (!assigned) {
+      console.warn('403 third-party token: user not assigned to tenant', JSON.stringify({
+        sub: claims.sub,
+        identity,
         azp: claims['azp'],
       }));
       return {

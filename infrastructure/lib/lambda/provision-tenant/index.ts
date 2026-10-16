@@ -23,8 +23,14 @@ const TRUSTED_ISSUERS        = (process.env.TRUSTED_ISSUERS ?? '').split(',').fi
 const TEAMS_SLUG              = process.env.TEAMS_SLUG!;
 const TEAMS_API_KEY_SECRET_OCID = process.env.TEAMS_API_KEY_SECRET_OCID!;
 const OCI_KEY_SSM_NAME        = process.env.OCI_KEY_SSM_NAME!;
-const DEFAULT_LOCALITY        = process.env.DEFAULT_LOCALITY ?? 'US-3';
+// Teams API accepts only lowercase locality codes: us, jp, eu, au, uk, ca.
+const DEFAULT_LOCALITY        = process.env.DEFAULT_LOCALITY ?? 'us';
 const TEAMS_BASE              = `https://${TEAMS_SLUG}.teams.auth0.com`;
+// Truested proxy identities (Auth0 subs, e.g. the chatbot's M2M client) that may
+// delegate creation ownership on behalf of the actual end-user via X-Auth0-Sub /
+// X-Auth0-Email headers. All other callers are attributed from their own token.
+const TRUSTED_PROXY_SUBS      = (process.env.TRUSTED_PROXY_SUBS ?? '').split(',').map(s => s.trim()).filter(Boolean);
+const TENANT_MAP_TABLE        = process.env.TENANT_MAP_TABLE ?? 'dvly-user-tenant-map';
 
 // Auth0 Teams API requires admin_email to be an existing member of the team.
 // Phone-only signups have no email claim, so we use a fixed team admin for now.
@@ -59,7 +65,7 @@ function initOci(): Promise<void> {
 
 // Full scope list confirmed working against strategic-teams-poc1
 const ELEVATED_SCOPES = [
-  'read:client_grants',  'update:client_grants',
+  'read:client_grants',  'create:client_grants',  'update:client_grants',
   'read:clients',        'create:clients',        'update:clients',        'delete:clients',
   'read:client_keys',    'create:client_keys',    'update:client_keys',
   'read:connections',    'create:connections',    'update:connections',    'delete:connections',
@@ -134,10 +140,18 @@ async function createTenant(payload: {
     headers: await teamsAuth(),
     body: JSON.stringify(payload),
   });
-  const body = await res.json() as CreatedTenant & { status?: number; title?: string };
+  const body = await res.json() as CreatedTenant & { status?: number; title?: string; type?: string };
   if (res.status === 409) {
-    const err = new Error(`Tenant name already exists`) as Error & { statusCode: number };
-    err.statusCode = 409;
+    // Always log the raw body — the Teams API distinguishes a genuine name
+    // conflict from other 409s (e.g. quota) only in the response payload.
+    console.error('Teams create 409:', JSON.stringify(body));
+    if (body.type === 'TENANT_NAME_ALREADY_EXISTS') {
+      const err = new Error('Tenant name already exists') as Error & { statusCode: number };
+      err.statusCode = 409;
+      throw err;
+    }
+    const err = new Error(`Tenant creation conflict: ${body.title ?? JSON.stringify(body)}`) as Error & { statusCode: number };
+    err.statusCode = 502;
     throw err;
   }
   if (!res.ok) {
@@ -195,6 +209,21 @@ async function writeProvisioningStatus(
       created_by_email: { S: createdByEmail },
       ...(createdByPhone ? { created_by_phone: { S: createdByPhone } } : {}),
       created_at:       { S: new Date().toISOString() },
+    },
+  }));
+}
+
+// Record ownership: the creating user is authorized against their tenant in the
+// same table (`dvly-user-tenant-map`) the API authorizer and chatbot tenant
+// resolver read from, so they can immediately query status and use the MCP tools.
+async function writeOwnership(tenantId: string, userId: string, email: string) {
+  await dynamoClient.send(new PutItemCommand({
+    TableName: TENANT_MAP_TABLE,
+    Item: {
+      userId:     { S: userId },
+      tenantId:   { S: tenantId },
+      ...(email ? { note: { S: `Owned by ${email}; provisioned via streaming-reporting` } } : {}),
+      granted_at: { S: new Date().toISOString() },
     },
   }));
 }
@@ -302,6 +331,21 @@ export const handler = async (event: LambdaEvent) => {
   const locality       = req.locality        ?? DEFAULT_LOCALITY;
   const environment_tag = req.environment_tag ?? 'development';
 
+  // A trusted proxy (e.g. the chatbot backend) may create on behalf of an
+  // authenticated end-user and pass their identity via headers. Only honored
+  // when the *verified token* belongs to a configured trusted proxy sub — an
+  // ordinary caller's headers are ignored and they are attributed normally.
+  const headerSub   = event.headers?.['x-auth0-sub'] ?? event.headers?.['X-Auth0-Sub'] ?? event.headers?.['x-Auth0-Sub'];
+  const headerEmail = event.headers?.['x-auth0-email'] ?? event.headers?.['X-Auth0-Email'] ?? event.headers?.['x-Auth0-Email'];
+  const delegated = !!(headerSub && TRUSTED_PROXY_SUBS.includes(sub!));
+  const effectiveSub   = delegated ? headerSub : sub;
+  const effectiveEmail = delegated
+    ? (headerEmail ?? email ?? TEAMS_ADMIN_EMAIL)
+    : (email ?? TEAMS_ADMIN_EMAIL);
+  if (delegated) {
+    console.log('[provision] trusted proxy:', sub, 'creating on behalf of:', effectiveSub, effectiveEmail);
+  }
+
   try {
     // 3. Create tenant
     const tenant = await createTenant({
@@ -314,7 +358,7 @@ export const handler = async (event: LambdaEvent) => {
     // 4. Store management credentials in Secrets Manager
     await storeManagementClient(
       tenant.tenant_id, tenant.tenant_name, tenant.domain,
-      tenant.management_client, sub, email ?? TEAMS_ADMIN_EMAIL, phone,
+      tenant.management_client, effectiveSub, effectiveEmail, phone,
     );
 
     // 5. Self-elevate management_client to full Terraform-level scopes
@@ -324,8 +368,11 @@ export const handler = async (event: LambdaEvent) => {
 
     // 6. Write provisioning status to DynamoDB
     await writeProvisioningStatus(
-      tenant.tenant_id, tenant.tenant_name, tenant.domain, sub, email ?? TEAMS_ADMIN_EMAIL, phone,
+      tenant.tenant_id, tenant.tenant_name, tenant.domain, effectiveSub, effectiveEmail, phone,
     );
+
+    // 6b. Record ownership so the owner can query status and use MCP tools
+    await writeOwnership(tenant.tenant_id, effectiveSub, effectiveEmail);
 
     // 7. Publish event so configure Lambda can pick up async configuration
     await publishTenantProvisioned(tenant.tenant_id, tenant.domain);
