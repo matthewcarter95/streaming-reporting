@@ -309,7 +309,18 @@ export const handler = async (event: ApiGatewayV2Event) => {
     if (delegated) {
       console.log(`[mcp] trusted proxy ${claims.sub} acting on behalf of ${effectiveSub}`);
     }
-    if (!effectiveSub || tenant.created_by_sub !== effectiveSub) {
+    // First-party access is by creator OR assignment. Future-proofs shared/delegated
+    // tenants: any user assigned to the tenant may operate on it, not just its creator.
+    const isCreator = !!effectiveSub && tenant.created_by_sub === effectiveSub;
+    const isAssigned = !isCreator && !!effectiveSub
+      ? await isUserAssignedToTenant(effectiveSub, tenantId)
+      : false;
+    if (!effectiveSub || (!isCreator && !isAssigned)) {
+      console.warn('[mcp] 403 first-party token: user is neither creator nor assigned', JSON.stringify({
+        sub: claims.sub,
+        effectiveSub,
+        delegated,
+      }));
       return { statusCode: 403, body: JSON.stringify({ error: 'Not authorized for this tenant' }) };
     }
   } else {
