@@ -1,5 +1,12 @@
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { DynamoDBClient, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
+import {
+  EventBridgeClient,
+  ListEventSourcesCommand,
+  CreateEventBusCommand,
+  PutRuleCommand,
+  PutTargetsCommand,
+} from '@aws-sdk/client-eventbridge';
 
 // The OCI Vault reader comes from the dvly-oci-secrets Lambda layer and is
 // intentionally not bundled (see externalModules in apiStack.ts).
@@ -22,6 +29,21 @@ const PERSONA_DOMAIN              = process.env.PERSONA_DOMAIN ?? 'withpersona.c
 const PERSONA_INQUIRY_TEMPLATE_ID = process.env.PERSONA_INQUIRY_TEMPLATE_ID!;
 const EVENTBRIDGE_AWS_ACCOUNT_ID  = process.env.EVENTBRIDGE_AWS_ACCOUNT_ID ?? '223778538359';
 const EVENTBRIDGE_AWS_REGION      = process.env.EVENTBRIDGE_AWS_REGION ?? 'us-east-1';
+
+// Analytics pipeline sink: the Firehose delivery stream and the EventBridge role
+// that is allowed to put records into it (see ingestStack.ts).
+const DELIVERY_STREAM_ARN =
+  process.env.DELIVERY_STREAM_ARN ??
+  `arn:aws:firehose:${EVENTBRIDGE_AWS_REGION}:${EVENTBRIDGE_AWS_ACCOUNT_ID}:deliverystream/auth0-events-analytics`;
+const EB_FIREHOSE_ROLE_ARN =
+  process.env.EB_FIREHOSE_ROLE_ARN ??
+  `arn:aws:iam::${EVENTBRIDGE_AWS_ACCOUNT_ID}:role/auth0-analytics-eb-firehose-role`;
+// Auth0 names each partner event source:
+//   aws.partner/auth0.com/<tenant-name>-<uuid>/auth0.logs
+const PARTNER_EVENT_SOURCE_PREFIX = 'aws.partner/auth0.com/';
+const PARTNER_EVENT_SOURCE_SUFFIX = '/auth0.logs';
+
+const eventBridgeClient = new EventBridgeClient({ region: EVENTBRIDGE_AWS_REGION });
 
 // ── Third-party MCP / federation config ────────────────────────────────────
 // Public base URL of the MCP server; a tenant's OAuth resource identifier is
@@ -444,6 +466,83 @@ async function createLogStream(domain: string, accessToken: string) {
   }
 }
 
+// Auth0 names the partner event source after the tenant's friendly name with a
+// generated UUID suffix: aws.partner/auth0.com/<tenant-name>-<uuid>/auth0.logs.
+// Strip the trailing "-<uuid>" (36-char uuid + 1 separator hyphen = 37 chars) to
+// recover the tenant slug — the same derivation the transform Lambda uses.
+function sourceSlug(sourceName: string): string {
+  const segment = sourceName.split('/')[2] ?? '';
+  return segment.length > 37 ? segment.slice(0, segment.length - 37) : segment;
+}
+
+async function findPendingEventSource(candidates: string[]): Promise<string | null> {
+  const wanted = new Set(candidates.filter(Boolean));
+  const maxAttempts = 6;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await eventBridgeClient.send(new ListEventSourcesCommand({}));
+    const match = (res.EventSources ?? []).find((s) =>
+      s.State === 'PENDING' &&
+      typeof s.Name === 'string' &&
+      s.Name.startsWith(PARTNER_EVENT_SOURCE_PREFIX) &&
+      s.Name.endsWith(PARTNER_EVENT_SOURCE_SUFFIX) &&
+      wanted.has(sourceSlug(s.Name)),
+    );
+    if (match?.Name) return match.Name;
+    // The partner event source may lag the log-stream creation; retry briefly.
+    if (attempt < maxAttempts) await new Promise((r) => setTimeout(r, 3000));
+  }
+  return null;
+}
+
+// As part of tenant configuration we must do the AWS-side wiring that Auth0's
+// log stream cannot: associate the pending partner event source with an event
+// bus ("service bus") and attach a rule routing its events to the analytics
+// Firehose. Auth0 does not replay events, so anything before this runs is lost
+// to the lake.
+async function wireEventBridgeBus(tenantName?: string, domain?: string) {
+  const candidates = [tenantName, domain?.split('.')[0]].filter((v): v is string => !!v);
+  if (candidates.length === 0) {
+    console.warn('Event bus wiring skipped: no tenant name or domain available');
+    return;
+  }
+
+  const sourceName = await findPendingEventSource(candidates);
+  if (!sourceName) {
+    console.warn(`No pending partner event source for ${candidates.join(' / ')}; skipping bus association`);
+    return;
+  }
+
+  // The event bus name must equal the event source name. Re-creating is a no-op.
+  let busArn = `arn:aws:events:${EVENTBRIDGE_AWS_REGION}:${EVENTBRIDGE_AWS_ACCOUNT_ID}:event-bus/${sourceName}`;
+  try {
+    const created = await eventBridgeClient.send(new CreateEventBusCommand({
+      Name: sourceName,
+      EventSourceName: sourceName,
+    }));
+    if (created.EventBusArn) busArn = created.EventBusArn;
+  } catch (err) {
+    if ((err as Error).name !== 'ResourceAlreadyExistsException') throw err;
+  }
+
+  const ruleName = `Auth0Analytics-${candidates[0]}`;
+  await eventBridgeClient.send(new PutRuleCommand({
+    Name: ruleName,
+    EventBusName: busArn,
+    EventPattern: JSON.stringify({ source: [{ prefix: 'aws.partner/auth0.com' }] }),
+    State: 'ENABLED',
+  }));
+  await eventBridgeClient.send(new PutTargetsCommand({
+    Rule: ruleName,
+    EventBusName: busArn,
+    Targets: [{
+      Id: 'FirehoseDelivery',
+      Arn: DELIVERY_STREAM_ARN,
+      RoleArn: EB_FIREHOSE_ROLE_ARN,
+    }],
+  }));
+  console.log(`Wired event bus for ${candidates[0]}: ${busArn}`);
+}
+
 async function updatePromptSettings(domain: string, accessToken: string) {
   const res = await fetch(`https://${domain}/api/v2/prompts`, {
     method: 'PATCH',
@@ -852,6 +951,18 @@ export const handler = async (event: { detail: EventBridgeDetail }) => {
     console.log(`MCP configured: client_id=${cimdClientId} resource=${mcpResourceIdentifier}`);
 
     let warning: string | undefined;
+
+    // AWS-side wiring for the log stream we just created: associate the partner
+    // event bus and route its events into the analytics lake. Non-fatal so an
+    // EventBridge hiccup doesn't mark an otherwise-configured tenant failed.
+    try {
+      await wireEventBridgeBus(mc.tenant_name, mc.domain);
+    } catch (busErr) {
+      const msg = (busErr as Error).message;
+      console.error('Event bus wiring failed (non-fatal):', msg);
+      warning = `Event bus wiring failed: ${msg}`;
+    }
+
     try {
       await createPortal(mc.domain, accessToken, passkeyConnectionId);
     } catch (portalErr) {

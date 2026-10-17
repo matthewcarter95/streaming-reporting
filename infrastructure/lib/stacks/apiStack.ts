@@ -26,6 +26,13 @@ export class ApiStack extends cdk.Stack {
 
     const { eventsBucket, athenaWorkgroup, tenantMappingTable } = props.storageStack;
 
+    // Analytics pipeline resources created by ingestStack.ts. Their names are
+    // stable, so the ARNs are constructed directly (no cross-stack reference).
+    const deliveryStreamArn = (this.node.tryGetContext('deliveryStreamArn') as string | undefined)
+      ?? `arn:aws:firehose:${this.region}:${this.account}:deliverystream/auth0-events-analytics`;
+    const ebFirehoseRoleArn = (this.node.tryGetContext('ebFirehoseRoleArn') as string | undefined)
+      ?? `arn:aws:iam::${this.account}:role/auth0-analytics-eb-firehose-role`;
+
     const auth0Domain = this.node.tryGetContext('auth0Domain') as string;
     const auth0Audience = this.node.tryGetContext('auth0Audience') as string;
     const tenantClaim = (this.node.tryGetContext('tenantClaim') as string | undefined) ?? 'sub';
@@ -306,6 +313,10 @@ export class ApiStack extends cdk.Stack {
         PERSONA_INQUIRY_TEMPLATE_ID:   personaInquiryTemplateId,
         EVENTBRIDGE_AWS_ACCOUNT_ID:    this.account,
         EVENTBRIDGE_AWS_REGION:        this.region,
+        // Analytics pipeline sink (see ingestStack.ts) — used to wire each new
+        // tenant's partner event bus to Firehose on provision.
+        DELIVERY_STREAM_ARN:           deliveryStreamArn,
+        EB_FIREHOSE_ROLE_ARN:          ebFirehoseRoleArn,
         // MCP / third-party federation config (see configure-tenant/index.ts).
         MCP_RESOURCE_BASE_URL:         mcpBaseUrl,
         CLAUDE_CIMD_URL:               claudeCimdUrl,
@@ -317,6 +328,31 @@ export class ApiStack extends cdk.Stack {
       layers: [ociSecretsLayer],
       bundling: { externalModules: ['@aws-sdk/*', 'dvly-oci-secrets'], minify: true },
     });
+
+    // Wire each new tenant's Auth0 partner event bus to the analytics Firehose:
+    // associate the pending partner event source and create the routing rule.
+    configureFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['events:ListEventSources'],
+      resources: ['*'],
+    }));
+    configureFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['events:CreateEventBus', 'events:DescribeEventBus'],
+      resources: [
+        `arn:aws:events:${this.region}:${this.account}:event-bus/aws.partner/auth0.com/*`,
+      ],
+    }));
+    configureFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['events:PutRule', 'events:PutTargets', 'events:DescribeRule', 'events:EnableRule'],
+      resources: [
+        `arn:aws:events:${this.region}:${this.account}:rule/aws.partner/auth0.com/*`,
+        `arn:aws:events:${this.region}:${this.account}:event-bus/aws.partner/auth0.com/*`,
+      ],
+    }));
+    configureFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['iam:PassRole'],
+      resources: [ebFirehoseRoleArn],
+      conditions: { StringEquals: { 'iam:PassedToService': 'events.amazonaws.com' } },
+    }));
 
     tenantTable.grantWriteData(configureFn);
     grantOciKeyRead(configureFn);
