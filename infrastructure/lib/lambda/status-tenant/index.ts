@@ -27,6 +27,8 @@ export const handler = async (event: { pathParameters?: Record<string, string> }
     tenant_id:        item['tenant_id']?.S,
     tenant_name:      item['tenant_name']?.S,
     domain:           item['domain']?.S,
+    region:           item['region']?.S,
+    type:             item['type']?.S,
     status:           item['status']?.S,
     created_at:       item['created_at']?.S,
     created_by_sub:   item['created_by_sub']?.S,

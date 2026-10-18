@@ -25,6 +25,14 @@ const TEAMS_API_KEY_SECRET_OCID = process.env.TEAMS_API_KEY_SECRET_OCID!;
 const OCI_KEY_SSM_NAME        = process.env.OCI_KEY_SSM_NAME!;
 // Teams API accepts only lowercase locality codes: us, jp, eu, au, uk, ca.
 const DEFAULT_LOCALITY        = process.env.DEFAULT_LOCALITY ?? 'us';
+// Dvly's own environment type. Teams only accepts "development" | "staging" |
+// "production"; we expose the shorter dev/test/prod and map at the boundary so
+// billing can split prod vs non-prod (see the Metronome migration plan).
+const ALLOWED_REGIONS         = ['us', 'eu', 'au', 'jp', 'ca', 'uk'];
+const ALLOWED_TYPES           = ['dev', 'test', 'prod'];
+const DEFAULT_TYPE            = process.env.DEFAULT_TYPE ?? 'dev';
+const TYPE_TO_ENV_TAG: Record<string, string> = { dev: 'development', test: 'staging', prod: 'production' };
+const ENV_TAG_TO_TYPE: Record<string, string> = { development: 'dev', staging: 'test', production: 'prod' };
 const TEAMS_BASE              = `https://${TEAMS_SLUG}.teams.auth0.com`;
 // Truested proxy identities (Auth0 subs, e.g. the chatbot's M2M client) that may
 // delegate creation ownership on behalf of the actual end-user via X-Auth0-Sub /
@@ -45,6 +53,134 @@ const TENANT_TABLE   = process.env.TENANT_TABLE ?? 'auth0-provisioned-tenants';
 // names allow only [A-Za-z0-9._-], so we use dots instead of slashes.
 const TENANT_SECRET_PREFIX = 'auth0.tenants.';
 const tenantSecretName = (tenantId: string) => `${TENANT_SECRET_PREFIX}${tenantId}`;
+
+// ── Metronome / Stripe (Dvly customer provisioning) ──────────────────────────
+// A Dvly customer (the Auth0 user who onboards) can own MANY Auth0 tenants, so
+// the billing customer is created once per Dvly customer — never once per
+// tenant. On each provision we look the customer up by ingest alias (the
+// owner's sub) and reuse it, creating it only when it does not exist yet. Both
+// API roles use their own OCI-held token: the writer token manages customers,
+// the ingest token is only used by the meter. These calls are non-fatal.
+const METRONOME_BASE_URL            = process.env.METRONOME_BASE_URL ?? 'https://api.metronome.com';
+const METRONOME_CUSTOMER_TOKEN_OCID = process.env.METRONOME_CUSTOMER_TOKEN_OCID ?? '';
+// Stripe secret key OCID — used to pair a Stripe customer with a new Dvly
+// customer (see auth0-signup-meter's deploy-params.yaml for the same secret).
+const STRIPE_CUSTOMER_SECRET_OCID   = process.env.STRIPE_CUSTOMER_SECRET_OCID ?? '';
+const STRIPE_BASE_URL               = 'https://api.stripe.com';
+
+// OCI secrets are cached per-OCID per container (the layer already caches
+// internally, but this avoids re-entering initOci for every lookup).
+const _secretCache = new Map<string, Promise<string>>();
+function ociSecret(ocid: string): Promise<string> {
+  let p = _secretCache.get(ocid);
+  if (!p) {
+    p = (async () => {
+      await initOci();
+      return ociSecrets.getSecretByOcid(ocid);
+    })();
+    _secretCache.set(ocid, p);
+  }
+  return p;
+}
+
+async function httpJson(
+  method: string, url: string, token: string, body?: string, contentType = 'application/json',
+) {
+  const res = await fetch(url, {
+    method,
+    headers: {
+      authorization: `Bearer ${token}`,
+      ...(body !== undefined ? { 'content-type': contentType } : {}),
+    },
+    ...(body !== undefined ? { body } : {}),
+  });
+  const text = await res.text();
+  let parsed: unknown;
+  try { parsed = text ? JSON.parse(text) : undefined; } catch { /* non-JSON */ }
+  return { status: res.status, ok: res.ok, text, parsed };
+}
+
+// Find an existing Metronome customer by ingest alias. Tries each alias in turn
+// (the owner's Auth0 sub first, then email) so a customer created under either
+// identity is reused rather than duplicated. Returns its Metronome UUID.
+async function findMetronomeCustomerByAliases(aliases: string[]): Promise<string | undefined> {
+  if (!METRONOME_CUSTOMER_TOKEN_OCID) return undefined;
+  const token = await ociSecret(METRONOME_CUSTOMER_TOKEN_OCID);
+  for (const alias of aliases) {
+    if (!alias) continue;
+    const url = `${METRONOME_BASE_URL}/v1/customers?ingest_alias=${encodeURIComponent(alias)}&limit=1`;
+    const res = await httpJson('GET', url, token);
+    if (!res.ok) throw new Error(`metronome list ${res.status}: ${res.text.slice(0, 200)}`);
+    const data = (res.parsed as { data?: Array<{ id?: string }> } | undefined)?.data;
+    if (Array.isArray(data) && data.length && data[0]?.id) return data[0].id;
+  }
+  return undefined;
+}
+
+async function createMetronomeCustomer(name: string, aliases: string[]): Promise<string> {
+  const token = await ociSecret(METRONOME_CUSTOMER_TOKEN_OCID);
+  const res = await httpJson(
+    'POST', `${METRONOME_BASE_URL}/v1/customers`, token,
+    JSON.stringify({ name, ingest_aliases: aliases }),
+  );
+  if (!res.ok) throw new Error(`metronome create ${res.status}: ${res.text.slice(0, 200)}`);
+  const id = (res.parsed as { data?: { id?: string } } | undefined)?.data?.id;
+  if (!id) throw new Error('metronome create returned no customer id');
+  return id;
+}
+
+async function createStripeCustomer(name: string, email: string | undefined, sub: string): Promise<string> {
+  const token = await ociSecret(STRIPE_CUSTOMER_SECRET_OCID);
+  const params = new URLSearchParams();
+  if (email) params.set('email', email);
+  params.set('name', name);
+  params.set('description', `Dvly customer ${sub}`);
+  const res = await httpJson(
+    'POST', `${STRIPE_BASE_URL}/v1/customers`, token,
+    params.toString(), 'application/x-www-form-urlencoded',
+  );
+  if (!res.ok) throw new Error(`stripe create ${res.status}: ${res.text.slice(0, 200)}`);
+  const id = (res.parsed as { id?: string } | undefined)?.id;
+  if (!id) throw new Error('stripe create returned no customer id');
+  return id;
+}
+
+interface DvlyCustomer {
+  metronomeCustomerId?: string;
+  stripeCustomerId?:   string;
+  created: boolean;
+}
+
+// Locate (or create) the billing customer for a Dvly customer. Idempotent:
+// the Metronome lookup by ingest alias short-circuits the create, and the
+// ingest aliases are set to [sub, email] so usage can later be keyed by either.
+async function ensureDvlyCustomer(sub: string, email: string | undefined): Promise<DvlyCustomer> {
+  const out: DvlyCustomer = { created: false };
+  if (!METRONOME_CUSTOMER_TOKEN_OCID) {
+    console.warn('[provision] METRONOME_CUSTOMER_TOKEN_OCID not set; skipping customer provisioning');
+    return out;
+  }
+
+  const name = email || sub;
+  const aliases = [sub, ...(email ? [email] : [])].filter(Boolean);
+
+  let metronomeCustomerId = await findMetronomeCustomerByAliases(aliases);
+  if (!metronomeCustomerId) {
+    metronomeCustomerId = await createMetronomeCustomer(name, aliases);
+    out.created = true;
+    // Pair a Stripe customer with a brand-new Dvly customer (only on create).
+    if (STRIPE_CUSTOMER_SECRET_OCID) {
+      try {
+        out.stripeCustomerId = await createStripeCustomer(name, email, sub);
+      } catch (err) {
+        console.warn('[provision] stripe customer create failed:', (err as Error).message);
+      }
+    }
+  }
+
+  out.metronomeCustomerId = metronomeCustomerId;
+  return out;
+}
 
 // Fetch the OCI signing key from SSM once per container and configure the layer.
 let _ociReady: Promise<void> | null = null;
@@ -113,6 +249,8 @@ async function teamsAuth() {
 
 interface TenantRequest {
   tenant_name?:     string;
+  region?:          string;
+  type?:            string;
   locality?:        string;
   environment_tag?: string;
 }
@@ -196,7 +334,9 @@ async function elevateManagementClient(domain: string, clientId: string, clientS
 
 async function writeProvisioningStatus(
   tenantId: string, tenantName: string, domain: string,
-  createdBySub: string, createdByEmail: string, createdByPhone?: string,
+  createdBySub: string, createdByEmail: string, createdByPhone: string | undefined,
+  region: string, type: string,
+  billing?: { metronomeCustomerId?: string; stripeCustomerId?: string },
 ) {
   await dynamoClient.send(new PutItemCommand({
     TableName: TENANT_TABLE,
@@ -204,7 +344,12 @@ async function writeProvisioningStatus(
       tenant_id:        { S: tenantId },
       tenant_name:      { S: tenantName },
       domain:           { S: domain },
+      region:           { S: region },
+      type:             { S: type },
       status:           { S: 'provisioning' },
+      // Denormalised billing-customer ids (a Dvly customer owns many tenants).
+      ...(billing?.metronomeCustomerId ? { metronome_customer_id: { S: billing.metronomeCustomerId } } : {}),
+      ...(billing?.stripeCustomerId   ? { stripe_customer_id:   { S: billing.stripeCustomerId }   } : {}),
       created_by_sub:   { S: createdBySub },
       created_by_email: { S: createdByEmail },
       ...(createdByPhone ? { created_by_phone: { S: createdByPhone } } : {}),
@@ -228,12 +373,12 @@ async function writeOwnership(tenantId: string, userId: string, email: string) {
   }));
 }
 
-async function publishTenantProvisioned(tenantId: string, domain: string) {
+async function publishTenantProvisioned(tenantId: string, domain: string, region: string, type: string) {
   await ebClient.send(new PutEventsCommand({
     Entries: [{
       Source:       'auth0.provisioner',
       DetailType:   'tenant.provisioned',
-      Detail:       JSON.stringify({ tenant_id: tenantId, domain }),
+      Detail:       JSON.stringify({ tenant_id: tenantId, domain, region, type }),
       EventBusName: 'default',
     }],
   }));
@@ -246,7 +391,9 @@ async function storeManagementClient(
   mc: ManagementClient,
   createdBySub: string,
   createdByEmail: string,
-  createdByPhone?: string,
+  createdByPhone: string | undefined,
+  region: string,
+  type: string,
 ) {
   await initOci();
   await ociSecrets.createOrUpdateSecret({
@@ -257,6 +404,8 @@ async function storeManagementClient(
       client_secret:    mc.client_secret,
       domain,
       tenant_name:      tenantName,
+      region,
+      type,
       created_by_sub:   createdBySub,
       created_by_email: createdByEmail,
       ...(createdByPhone ? { created_by_phone: createdByPhone } : {}),
@@ -328,8 +477,22 @@ export const handler = async (event: LambdaEvent) => {
     return response(400, { error: 'Invalid JSON body' });
   }
 
-  const locality       = req.locality        ?? DEFAULT_LOCALITY;
-  const environment_tag = req.environment_tag ?? 'development';
+  // 2b. Resolve billing-relevant attributes (region + type). `region` is the
+  // Auth0 locality (us/eu/...) and `type` is Dvly's dev|test|prod, mapped to the
+  // Teams environment_tag enum (development|staging|production). Both are stored
+  // on the tenant so downstream billing can emit the right Metronome metrics.
+  const locality       = (req.region ?? req.locality ?? DEFAULT_LOCALITY).toLowerCase();
+  if (!ALLOWED_REGIONS.includes(locality)) {
+    return response(400, { error: `Invalid region '${locality}' (allowed: ${ALLOWED_REGIONS.join(', ')})` });
+  }
+  let type = (req.type ?? '').toLowerCase();
+  if (!type && req.environment_tag) type = ENV_TAG_TO_TYPE[req.environment_tag.toLowerCase()] ?? '';
+  if (!type) type = DEFAULT_TYPE;
+  if (!ALLOWED_TYPES.includes(type)) {
+    return response(400, { error: `Invalid type '${type}' (allowed: ${ALLOWED_TYPES.join(', ')})` });
+  }
+  const environment_tag = TYPE_TO_ENV_TAG[type];
+  const region = locality;
 
   // A trusted proxy (e.g. the chatbot backend) may create on behalf of an
   // authenticated end-user and pass their identity via headers. Only honored
@@ -358,7 +521,7 @@ export const handler = async (event: LambdaEvent) => {
     // 4. Store management credentials in Secrets Manager
     await storeManagementClient(
       tenant.tenant_id, tenant.tenant_name, tenant.domain,
-      tenant.management_client, effectiveSub, effectiveEmail, phone,
+      tenant.management_client, effectiveSub, effectiveEmail, phone, region, type,
     );
 
     // 5. Self-elevate management_client to full Terraform-level scopes
@@ -366,22 +529,38 @@ export const handler = async (event: LambdaEvent) => {
       tenant.domain, tenant.management_client.client_id, tenant.management_client.client_secret,
     );
 
+    // 5b. Ensure the Dvly (Metronome/Stripe) customer exists for this owner.
+    // A Dvly customer can own many tenants, so this is lookup-first and
+    // idempotent — and it must never fail tenant provisioning.
+    let dvlyCustomer: DvlyCustomer = { created: false };
+    try {
+      dvlyCustomer = await ensureDvlyCustomer(effectiveSub, effectiveEmail);
+      if (dvlyCustomer.metronomeCustomerId) {
+        console.log('[provision] dvly customer:', dvlyCustomer.metronomeCustomerId, 'created:', dvlyCustomer.created);
+      }
+    } catch (err) {
+      console.warn('[provision] dvly customer provisioning failed:', (err as Error).message);
+    }
+
     // 6. Write provisioning status to DynamoDB
     await writeProvisioningStatus(
-      tenant.tenant_id, tenant.tenant_name, tenant.domain, effectiveSub, effectiveEmail, phone,
+      tenant.tenant_id, tenant.tenant_name, tenant.domain, effectiveSub, effectiveEmail, phone, region, type,
+      dvlyCustomer,
     );
 
     // 6b. Record ownership so the owner can query status and use MCP tools
     await writeOwnership(tenant.tenant_id, effectiveSub, effectiveEmail);
 
     // 7. Publish event so configure Lambda can pick up async configuration
-    await publishTenantProvisioned(tenant.tenant_id, tenant.domain);
+    await publishTenantProvisioned(tenant.tenant_id, tenant.domain, region, type);
 
     // 8. Return 202 — configuration continues asynchronously
     return response(202, {
       tenant_id:   tenant.tenant_id,
       tenant_name: tenant.tenant_name,
       domain:      tenant.domain,
+      region,
+      type,
       status:      'provisioning',
     });
 

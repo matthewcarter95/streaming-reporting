@@ -77,6 +77,16 @@ export class ApiStack extends cdk.Stack {
     const teamsApiKeySecretOcid   = (this.node.tryGetContext('teamsApiKeySecretOcid')   as string | undefined) ?? '';
     const personaApiKeySecretOcid = (this.node.tryGetContext('personaApiKeySecretOcid') as string | undefined) ?? '';
 
+    // ── Metronome / Stripe (Dvly customer provisioning) ──────────────────────
+    // A Dvly customer can own many tenants, so the provisioner looks the billing
+    // customer up by ingest alias and creates it only when missing (see
+    // provision-tenant/ensureDvlyCustomer). Tokens are held in OCI Vault; the
+    // writer token manages Metronome customers, the ingest token is only used by
+    // auth0-metronome-meter.
+    const metronomeBaseUrl            = (this.node.tryGetContext('metronomeBaseUrl')            as string | undefined) ?? 'https://api.metronome.com';
+    const metronomeCustomerTokenOcid  = (this.node.tryGetContext('metronomeCustomerTokenOcid')  as string | undefined) ?? '';
+    const stripeCustomerSecretOcid    = (this.node.tryGetContext('stripeCustomerSecretOcid')    as string | undefined) ?? '';
+
     const ociEnv = {
       OCI_REGION:           ociRegion,
       OCI_TENANCY_OCID:     ociTenancyOcid,
@@ -228,6 +238,9 @@ export class ApiStack extends cdk.Stack {
         DEFAULT_LOCALITY:           defaultLocality,
         TRUSTED_PROXY_SUBS:         trustedProxySubs,
         TENANT_MAP_TABLE:           tenantMappingTable.tableName,
+        METRONOME_BASE_URL:         metronomeBaseUrl,
+        METRONOME_CUSTOMER_TOKEN_OCID: metronomeCustomerTokenOcid,
+        STRIPE_CUSTOMER_SECRET_OCID:   stripeCustomerSecretOcid,
         ...ociEnv,
       },
       layers: [ociSecretsLayer],

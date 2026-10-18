@@ -17,6 +17,8 @@
     "ociKeyId": "ocid1.key.oc1.iad.ejtifep6aahfs.abuwcljrrcg6wmk7uzbh36ojifr4pzoofoycytwg4fbt2e4jmp36ch42xuuq",
     "teamsApiKeySecretOcid": "ocid1.vaultsecret.oc1.iad.amaaaaaallwnvmiaot4twzdyfoslx4zstxoovlko7tekj3slv7ugmheqgb3q",
     "personaApiKeySecretOcid": "ocid1.vaultsecret.oc1.iad.amaaaaaallwnvmiata6fq62phqzkqldimn42qnkdfht7i5af6l2kr35if2cq",
+    "metronomeCustomerTokenOcid": "ocid1.vaultsecret.oc1.iad.amaaaaaallwnvmiau25l6cletlruzpqlsyaa347xswyadxbpd6haxjoir72q",
+    "stripeCustomerSecretOcid": "ocid1.vaultsecret.oc1.iad.amaaaaaallwnvmiacwrnizg4iao3v5vutgqev3amcwwjzykndakflmu7plmq",
     "trustedProxySubs": "iomyI2SEONMEikPNjSMd5k6BBLJ67qah@clients",
     "corsOrigins": "*",
     "tenantClaim": "sub",
