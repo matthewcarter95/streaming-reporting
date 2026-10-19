@@ -23,6 +23,24 @@ export class ApiStack extends cdk.Stack {
 
     const { eventsBucket, athenaWorkgroup } = props.storageStack;
 
+    // Analytics pipeline resources created by ingestStack.ts. Their names are
+    // stable, so the ARNs are constructed directly (no cross-stack reference).
+    const deliveryStreamArn = (this.node.tryGetContext('deliveryStreamArn') as string | undefined)
+      ?? `arn:aws:firehose:${this.region}:${this.account}:deliverystream/auth0-events-analytics`;
+    const ebFirehoseRoleArn = (this.node.tryGetContext('ebFirehoseRoleArn') as string | undefined)
+      ?? `arn:aws:iam::${this.account}:role/auth0-analytics-eb-firehose-role`;
+
+    // Third-party MCP client (Claude) is registered by importing its CIMD URL.
+    const claudeCimdUrl = (this.node.tryGetContext('claudeCimdUrl') as string | undefined)
+      ?? 'https://claude.ai/oauth/mcp-oauth-client-metadata';
+
+    // Enterprise OIDC connector federating each tenant to a shared upstream IdP.
+    // Skipped by configure-tenant until both the client id and secret ARN are set.
+    const ciamOidcDiscoveryUrl = (this.node.tryGetContext('ciamOidcDiscoveryUrl') as string | undefined)
+      ?? `https://${this.node.tryGetContext('auth0Domain')}/.well-known/openid-configuration`;
+    const ciamOidcClientId = (this.node.tryGetContext('ciamOidcClientId') as string | undefined) ?? '';
+    const ciamOidcClientSecretArn = (this.node.tryGetContext('ciamOidcClientSecretArn') as string | undefined) ?? '';
+
     const auth0Domain = this.node.tryGetContext('auth0Domain') as string;
     const auth0Audience = this.node.tryGetContext('auth0Audience') as string;
     const tenantClaim = (this.node.tryGetContext('tenantClaim') as string | undefined) ?? 'org_id';
@@ -228,11 +246,46 @@ export class ApiStack extends cdk.Stack {
         PERSONA_API_KEY_SECRET_ARN:    personaApiKeySecretArn,
         PERSONA_DOMAIN:                personaDomain,
         PERSONA_INQUIRY_TEMPLATE_ID:   personaInquiryTemplateId,
-        EVENTBRIDGE_AWS_ACCOUNT_ID:    '223778538359',
-        EVENTBRIDGE_AWS_REGION:        'us-east-1',
+        EVENTBRIDGE_AWS_ACCOUNT_ID:    this.account,
+        EVENTBRIDGE_AWS_REGION:        this.region,
+        // Analytics pipeline sink (see ingestStack.ts) — used to wire each new
+        // tenant's partner event bus to Firehose on provision.
+        DELIVERY_STREAM_ARN:           deliveryStreamArn,
+        EB_FIREHOSE_ROLE_ARN:          ebFirehoseRoleArn,
+        // MCP / third-party federation config (see configure-tenant/index.ts).
+        // MCP_RESOURCE_BASE_URL is added below once the HttpApi exists.
+        CLAUDE_CIMD_URL:               claudeCimdUrl,
+        CIAM_OIDC_DISCOVERY_URL:       ciamOidcDiscoveryUrl,
+        CIAM_OIDC_CLIENT_ID:           ciamOidcClientId,
+        CIAM_OIDC_CLIENT_SECRET_ARN:   ciamOidcClientSecretArn,
       },
       bundling: { externalModules: ['@aws-sdk/*'], minify: true },
     });
+
+    // Wire each new tenant's Auth0 partner event bus to the analytics Firehose:
+    // associate the pending partner event source and create the routing rule.
+    configureFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['events:ListEventSources'],
+      resources: ['*'],
+    }));
+    configureFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['events:CreateEventBus', 'events:DescribeEventBus'],
+      resources: [
+        `arn:aws:events:${this.region}:${this.account}:event-bus/aws.partner/auth0.com/*`,
+      ],
+    }));
+    configureFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['events:PutRule', 'events:PutTargets', 'events:DescribeRule', 'events:EnableRule'],
+      resources: [
+        `arn:aws:events:${this.region}:${this.account}:rule/aws.partner/auth0.com/*`,
+        `arn:aws:events:${this.region}:${this.account}:event-bus/aws.partner/auth0.com/*`,
+      ],
+    }));
+    configureFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['iam:PassRole'],
+      resources: [ebFirehoseRoleArn],
+      conditions: { StringEquals: { 'iam:PassedToService': 'events.amazonaws.com' } },
+    }));
 
     tenantTable.grantWriteData(configureFn);
     configureFn.addToRolePolicy(new iam.PolicyStatement({
@@ -240,6 +293,7 @@ export class ApiStack extends cdk.Stack {
       resources: [
         `arn:aws:secretsmanager:${this.region}:${this.account}:secret:auth0/tenants/*`,
         personaApiKeySecretArn,
+        ...(ciamOidcClientSecretArn ? [ciamOidcClientSecretArn] : []),
       ],
     }));
 
@@ -402,6 +456,9 @@ export class ApiStack extends cdk.Stack {
     });
 
     mcpFn.addEnvironment('API_BASE_URL', httpApi.apiEndpoint);
+    // The tenant's OAuth resource identifier is `${base}/mcp/${tenantId}`, which
+    // must equal what mcp-tenant expects as `aud` (API_BASE_URL above).
+    configureFn.addEnvironment('MCP_RESOURCE_BASE_URL', httpApi.apiEndpoint);
 
     // Function URL for third-party MCP clients (e.g. Claude). API Gateway's
     // Lambda authorizer rejects a missing Authorization header with a bare 401

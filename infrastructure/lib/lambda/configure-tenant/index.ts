@@ -3,6 +3,13 @@ import {
   GetSecretValueCommand,
 } from '@aws-sdk/client-secrets-manager';
 import { DynamoDBClient, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
+import {
+  EventBridgeClient,
+  ListEventSourcesCommand,
+  CreateEventBusCommand,
+  PutRuleCommand,
+  PutTargetsCommand,
+} from '@aws-sdk/client-eventbridge';
 
 const region = process.env.AWS_REGION ?? 'us-east-1';
 const secretsClient = new SecretsManagerClient({ region });
@@ -10,10 +17,46 @@ const dynamoClient  = new DynamoDBClient({ region });
 
 const TENANT_TABLE                = process.env.TENANT_TABLE ?? 'auth0-provisioned-tenants';
 const PERSONA_API_KEY_SECRET_ARN  = process.env.PERSONA_API_KEY_SECRET_ARN!;
-const PERSONA_DOMAIN              = process.env.PERSONA_DOMAIN ?? 'withpersona.com';
+const PERSONA_DOMAIN             = process.env.PERSONA_DOMAIN ?? 'withpersona.com';
 const PERSONA_INQUIRY_TEMPLATE_ID = process.env.PERSONA_INQUIRY_TEMPLATE_ID!;
 const EVENTBRIDGE_AWS_ACCOUNT_ID  = process.env.EVENTBRIDGE_AWS_ACCOUNT_ID ?? '223778538359';
 const EVENTBRIDGE_AWS_REGION      = process.env.EVENTBRIDGE_AWS_REGION ?? 'us-east-1';
+
+// Analytics pipeline sink: the Firehose delivery stream and the EventBridge role
+// that is allowed to put records into it (see ingestStack.ts).
+const DELIVERY_STREAM_ARN =
+  process.env.DELIVERY_STREAM_ARN ??
+  `arn:aws:firehose:${EVENTBRIDGE_AWS_REGION}:${EVENTBRIDGE_AWS_ACCOUNT_ID}:deliverystream/auth0-events-analytics`;
+const EB_FIREHOSE_ROLE_ARN =
+  process.env.EB_FIREHOSE_ROLE_ARN ??
+  `arn:aws:iam::${EVENTBRIDGE_AWS_ACCOUNT_ID}:role/auth0-analytics-eb-firehose-role`;
+// Auth0 names each partner event source:
+//   aws.partner/auth0.com/<tenant-name>-<uuid>/auth0.logs
+const PARTNER_EVENT_SOURCE_PREFIX = 'aws.partner/auth0.com/';
+const PARTNER_EVENT_SOURCE_SUFFIX = '/auth0.logs';
+
+const eventBridgeClient = new EventBridgeClient({ region: EVENTBRIDGE_AWS_REGION });
+
+// ── Third-party MCP / federation config ────────────────────────────────────
+// Public base URL of the MCP server; a tenant's OAuth resource identifier is
+// `${MCP_RESOURCE_BASE_URL}/mcp/${tenantId}` and MUST match the URL the
+// mcp-tenant Lambda validates as `aud` (see apiStack.ts).
+const MCP_RESOURCE_BASE_URL = process.env.MCP_RESOURCE_BASE_URL ?? '';
+// The third-party MCP client (Claude) is registered by importing its CIMD.
+const CLAUDE_CIMD_URL = process.env.CLAUDE_CIMD_URL ?? 'https://claude.ai/oauth/mcp-oauth-client-metadata';
+// Enterprise OIDC connector: federate the tenant to our own ciam tenant using a
+// shared OIDC app registered in ciam (client_id + Secrets Manager client_secret).
+const CIAM_OIDC_DISCOVERY_URL        = process.env.CIAM_OIDC_DISCOVERY_URL ?? 'https://ciam.dvlysolutions.com/.well-known/openid-configuration';
+const CIAM_OIDC_CLIENT_ID            = process.env.CIAM_OIDC_CLIENT_ID ?? '';
+const CIAM_OIDC_CLIENT_SECRET_ARN    = process.env.CIAM_OIDC_CLIENT_SECRET_ARN ?? '';
+
+const MCP_RESOURCE_SERVER_NAME = 'Dvly MCP Server';
+const MCP_SCOPES = [
+  { value: 'auth0:read',  description: 'Read Auth0 tenant resources through the MCP server.' },
+  { value: 'auth0:write', description: 'Modify Auth0 tenant resources through the MCP server.' },
+];
+const CIAM_OIDC_CONNECTION_NAME = 'dvly-solutions';
+
 
 const PORTAL_APP_NAME = 'd-tenant-portal-app';
 const PORTAL_NAME     = 'd-tenant-portal';
@@ -21,10 +64,11 @@ const PORTAL_SLUG     = 'd-tenant-portal';
 const PASSKEY_OTP_CONNECTION_NAME = 'passkey-email-otp';
 
 interface ManagementClientSecret {
-  client_id:     string;
-  client_secret: string;
-  domain:        string;
-  tenant_name:   string;
+  client_id:         string;
+  client_secret:     string;
+  domain:            string;
+  tenant_name:       string;
+  created_by_email?: string;
 }
 
 interface EventBridgeDetail {
@@ -392,6 +436,83 @@ async function createLogStream(domain: string, accessToken: string) {
   }
 }
 
+// Auth0 names the partner event source after the tenant's friendly name with a
+// generated UUID suffix: aws.partner/auth0.com/<tenant-name>-<uuid>/auth0.logs.
+// Strip the trailing "-<uuid>" (36-char uuid + 1 separator hyphen = 37 chars) to
+// recover the tenant slug — the same derivation the transform Lambda uses.
+function sourceSlug(sourceName: string): string {
+  const segment = sourceName.split('/')[2] ?? '';
+  return segment.length > 37 ? segment.slice(0, segment.length - 37) : segment;
+}
+
+async function findPendingEventSource(candidates: string[]): Promise<string | null> {
+  const wanted = new Set(candidates.filter(Boolean));
+  const maxAttempts = 6;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await eventBridgeClient.send(new ListEventSourcesCommand({}));
+    const match = (res.EventSources ?? []).find((s) =>
+      s.State === 'PENDING' &&
+      typeof s.Name === 'string' &&
+      s.Name.startsWith(PARTNER_EVENT_SOURCE_PREFIX) &&
+      s.Name.endsWith(PARTNER_EVENT_SOURCE_SUFFIX) &&
+      wanted.has(sourceSlug(s.Name)),
+    );
+    if (match?.Name) return match.Name;
+    // The partner event source may lag the log-stream creation; retry briefly.
+    if (attempt < maxAttempts) await new Promise((r) => setTimeout(r, 3000));
+  }
+  return null;
+}
+
+// As part of tenant configuration we must do the AWS-side wiring that Auth0's
+// log stream cannot: associate the pending partner event source with an event
+// bus ("service bus") and attach a rule routing its events to the analytics
+// Firehose. Auth0 does not replay events, so anything before this runs is lost
+// to the lake.
+async function wireEventBridgeBus(tenantName?: string, domain?: string) {
+  const candidates = [tenantName, domain?.split('.')[0]].filter((v): v is string => !!v);
+  if (candidates.length === 0) {
+    console.warn('Event bus wiring skipped: no tenant name or domain available');
+    return;
+  }
+
+  const sourceName = await findPendingEventSource(candidates);
+  if (!sourceName) {
+    console.warn(`No pending partner event source for ${candidates.join(' / ')}; skipping bus association`);
+    return;
+  }
+
+  // The event bus name must equal the event source name. Re-creating is a no-op.
+  let busArn = `arn:aws:events:${EVENTBRIDGE_AWS_REGION}:${EVENTBRIDGE_AWS_ACCOUNT_ID}:event-bus/${sourceName}`;
+  try {
+    const created = await eventBridgeClient.send(new CreateEventBusCommand({
+      Name: sourceName,
+      EventSourceName: sourceName,
+    }));
+    if (created.EventBusArn) busArn = created.EventBusArn;
+  } catch (err) {
+    if ((err as Error).name !== 'ResourceAlreadyExistsException') throw err;
+  }
+
+  const ruleName = `Auth0Analytics-${candidates[0]}`;
+  await eventBridgeClient.send(new PutRuleCommand({
+    Name: ruleName,
+    EventBusName: busArn,
+    EventPattern: JSON.stringify({ source: [{ prefix: 'aws.partner/auth0.com' }] }),
+    State: 'ENABLED',
+  }));
+  await eventBridgeClient.send(new PutTargetsCommand({
+    Rule: ruleName,
+    EventBusName: busArn,
+    Targets: [{
+      Id: 'FirehoseDelivery',
+      Arn: DELIVERY_STREAM_ARN,
+      RoleArn: EB_FIREHOSE_ROLE_ARN,
+    }],
+  }));
+  console.log(`Wired event bus for ${candidates[0]}: ${busArn}`);
+}
+
 async function updatePromptSettings(domain: string, accessToken: string) {
   const res = await fetch(`https://${domain}/api/v2/prompts`, {
     method: 'PATCH',
@@ -505,6 +626,228 @@ async function createPortal(domain: string, accessToken: string, passkeyConnecti
   }
 }
 
+// ── Third-party MCP + enterprise federation setup ─────────────────────────
+
+// Enable CIMD (and the MCP-recommended resource-parameter compatibility profile)
+// so the Authorization Server advertises CIMD support and honours RFC 8707.
+async function enableCimdSupport(domain: string, accessToken: string): Promise<void> {
+  const res = await fetch(`https://${domain}/api/v2/tenants/settings`, {
+    method: 'PATCH',
+    headers: mgmtHeaders(accessToken),
+    body: JSON.stringify({
+      client_id_metadata_document_supported: true,
+      resource_parameter_profile:            'compatibility',
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Enable CIMD support failed ${res.status}: ${await res.text()}`);
+  }
+}
+
+// Register (idempotent upsert) the third-party MCP client by importing its CIMD.
+// Returns the client_id Auth0 assigned to the CIMD client.
+async function registerClaudeCimdClient(domain: string, accessToken: string): Promise<string> {
+  const res = await fetch(`https://${domain}/api/v2/clients/cimd/register`, {
+    method: 'POST',
+    headers: mgmtHeaders(accessToken),
+    body: JSON.stringify({ external_client_id: CLAUDE_CIMD_URL }),
+  });
+  if (!res.ok) {
+    throw new Error(`Register CIMD client failed ${res.status}: ${await res.text()}`);
+  }
+  const body = await res.json() as { client_id: string };
+  if (!body.client_id) {
+    throw new Error('Register CIMD client returned no client_id');
+  }
+  return body.client_id;
+}
+
+// Create (or reconcile) the resource server representing this tenant's MCP
+// service, with per-app authorization required for user-delegated access.
+async function ensureMcpResourceServer(domain: string, accessToken: string, identifier: string): Promise<void> {
+  const listRes = await fetch(`https://${domain}/api/v2/resource-servers`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!listRes.ok) {
+    throw new Error(`List resource servers failed ${listRes.status}: ${await listRes.text()}`);
+  }
+  const servers = await listRes.json() as Array<{ id: string; identifier: string }>;
+  let id = servers.find(s => s.identifier === identifier)?.id;
+
+  if (!id) {
+    const createRes = await fetch(`https://${domain}/api/v2/resource-servers`, {
+      method: 'POST',
+      headers: mgmtHeaders(accessToken),
+      body: JSON.stringify({
+        name:       MCP_RESOURCE_SERVER_NAME,
+        identifier,
+        scopes:     MCP_SCOPES,
+      }),
+    });
+    if (!createRes.ok) {
+      throw new Error(`Create resource server failed ${createRes.status}: ${await createRes.text()}`);
+    }
+    id = (await createRes.json() as { id: string }).id;
+  }
+
+  // Always reconcile scopes + the per-app authorization requirement (applied
+  // separately from create so we don't depend on its request schema).
+  const patchRes = await fetch(`https://${domain}/api/v2/resource-servers/${id}`, {
+    method: 'PATCH',
+    headers: mgmtHeaders(accessToken),
+    body: JSON.stringify({
+      scopes: MCP_SCOPES,
+      subject_type_authorization: {
+        user:   { policy: 'require_client_grant' },
+        client: { policy: 'require_client_grant' },
+      },
+    }),
+  });
+  if (!patchRes.ok) {
+    throw new Error(`Update resource server failed ${patchRes.status}: ${await patchRes.text()}`);
+  }
+}
+
+// Grant the CIMD client access to the MCP resource server with the MCP scopes.
+async function ensureClaudeClientGrant(
+  domain: string, accessToken: string, clientId: string, audience: string,
+): Promise<void> {
+  const scope = MCP_SCOPES.map(s => s.value);
+  const listRes = await fetch(
+    `https://${domain}/api/v2/client-grants?client_id=${encodeURIComponent(clientId)}&audience=${encodeURIComponent(audience)}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+  );
+  if (!listRes.ok) {
+    throw new Error(`List client grants failed ${listRes.status}: ${await listRes.text()}`);
+  }
+  const grants = await listRes.json() as Array<{ id: string; subject_type?: string }>;
+  const targetGrant = grants.find(g => g.subject_type === 'user') || grants[0];
+  if (targetGrant) {
+    const patchRes = await fetch(`https://${domain}/api/v2/client-grants/${targetGrant.id}`, {
+      method: 'PATCH',
+      headers: mgmtHeaders(accessToken),
+      body: JSON.stringify({ scope, subject_type: 'user' }),
+    });
+    if (!patchRes.ok) {
+      throw new Error(`Update client grant failed ${patchRes.status}: ${await patchRes.text()}`);
+    }
+    return;
+  }
+
+  const createRes = await fetch(`https://${domain}/api/v2/client-grants`, {
+    method: 'POST',
+    headers: mgmtHeaders(accessToken),
+    body: JSON.stringify({ client_id: clientId, audience, scope, subject_type: 'user' }),
+  });
+  if (!createRes.ok) {
+    throw new Error(`Create client grant failed ${createRes.status}: ${await createRes.text()}`);
+  }
+}
+
+// Promote the tenant's database connections to domain level. Third-party
+// (CIMD/strict) applications can only authenticate through domain-level
+// connections, so the default database connection must be promoted alongside
+// the enterprise OIDC connection.
+async function promoteDatabaseConnectionsToDomain(domain: string, accessToken: string): Promise<void> {
+  const res = await fetch(`https://${domain}/api/v2/connections?strategy=auth0`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!res.ok) {
+    throw new Error(`List database connections failed ${res.status}: ${await res.text()}`);
+  }
+  const conns = await res.json() as Array<{ id: string; name: string; is_domain_connection?: boolean }>;
+  for (const conn of conns) {
+    if (conn.is_domain_connection) continue;
+    const patch = await fetch(`https://${domain}/api/v2/connections/${conn.id}`, {
+      method: 'PATCH',
+      headers: mgmtHeaders(accessToken),
+      body: JSON.stringify({ is_domain_connection: true }),
+    });
+    if (!patch.ok) {
+      throw new Error(`Promote connection "${conn.name}" to domain level failed ${patch.status}: ${await patch.text()}`);
+    }
+  }
+}
+
+async function getCiamOidcClientSecret(): Promise<string> {
+  const res = await secretsClient.send(new GetSecretValueCommand({
+    SecretId: CIAM_OIDC_CLIENT_SECRET_ARN,
+  }));
+  return res.SecretString!;
+}
+
+// Create (or reuse) the enterprise OIDC connector to ciam and promote it to the
+// domain level so third-party (CIMD) applications can authenticate through it.
+// When the tenant owner's email domain is known (e.g. "demo-connect.us") it is
+// set as a domain alias so Home Realm Discovery routes those users straight to
+// the ciam IdP instead of showing every connection.
+async function ensureCiamEnterpriseConnection(
+  domain: string, accessToken: string, clientId: string, clientSecret: string,
+  emailDomain?: string,
+): Promise<string> {
+  const listRes = await fetch(
+    `https://${domain}/api/v2/connections?name=${encodeURIComponent(CIAM_OIDC_CONNECTION_NAME)}&strategy=oidc`,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+  );
+  if (!listRes.ok) {
+    throw new Error(`List connections failed ${listRes.status}: ${await listRes.text()}`);
+  }
+  const conns = await listRes.json() as Array<{ id: string }>;
+  let id = conns[0]?.id;
+
+  // Full desired options — re-asserted on both create and update. Auth0
+  // normalises/drops discovery_url & scopes on a partial options PATCH, so we
+  // always send the complete set to stay idempotent.
+  const options: Record<string, unknown> = {
+    type:          'back_channel',
+    discovery_url: CIAM_OIDC_DISCOVERY_URL,
+    client_id:     clientId,
+    client_secret: clientSecret,
+    scopes:        'openid profile email',
+    ...(emailDomain ? { domain_aliases: [emailDomain] } : {}),
+  };
+
+  if (!id) {
+    const createRes = await fetch(`https://${domain}/api/v2/connections`, {
+      method: 'POST',
+      headers: mgmtHeaders(accessToken),
+      body: JSON.stringify({
+        name:     CIAM_OIDC_CONNECTION_NAME,
+        strategy: 'oidc',
+        options,
+      }),
+    });
+    if (!createRes.ok) {
+      throw new Error(`Create enterprise OIDC connection failed ${createRes.status}: ${await createRes.text()}`);
+    }
+    id = (await createRes.json() as { id: string }).id;
+  } else {
+    // Existing connector — ensure the desired options (incl. HRD domain alias)
+    // are applied without waiting for a fresh tenant.
+    const optionsRes = await fetch(`https://${domain}/api/v2/connections/${id}`, {
+      method: 'PATCH',
+      headers: mgmtHeaders(accessToken),
+      body: JSON.stringify({ options }),
+    });
+    if (!optionsRes.ok) {
+      throw new Error(`Update enterprise OIDC connection failed ${optionsRes.status}: ${await optionsRes.text()}`);
+    }
+  }
+
+  // Promote to domain level. This is what makes the connection usable by
+  // third-party (CIMD/strict) applications — dynamic clients cannot be mapped
+  // to connections individually.
+  const promoteRes = await fetch(`https://${domain}/api/v2/connections/${id}`, {
+    method: 'PATCH',
+    headers: mgmtHeaders(accessToken),
+    body: JSON.stringify({ is_domain_connection: true }),
+  });
+  if (!promoteRes.ok) {
+    throw new Error(`Promote connection to domain level failed ${promoteRes.status}: ${await promoteRes.text()}`);
+  }
+  return id;
+}
+
 async function markTenantStatus(
   tenantId: string, status: 'ready' | 'failed', error?: string, warning?: string,
 ) {
@@ -562,13 +905,61 @@ export const handler = async (event: { detail: EventBridgeDetail }) => {
     const passkeyConnectionId = await createPasskeyOtpConnection(mc.domain, accessToken);
     await createLogStream(mc.domain, accessToken);
 
+    // Third-party MCP access: enable CIMD, register the Claude client, create the
+    // tenant's MCP resource server, and grant the client access to it. Core to
+    // the MCP feature, so a failure marks the tenant failed.
+    if (!MCP_RESOURCE_BASE_URL) {
+      throw new Error('MCP_RESOURCE_BASE_URL is not configured');
+    }
+    const mcpResourceIdentifier = `${MCP_RESOURCE_BASE_URL}/mcp/${tenantId}`;
+    await enableCimdSupport(mc.domain, accessToken);
+    // Domain-level connections are a prerequisite for third-party login, so
+    // promote the database connection(s) as well as the enterprise connector
+    // (promoted inside ensureCiamEnterpriseConnection).
+    await promoteDatabaseConnectionsToDomain(mc.domain, accessToken);
+    const cimdClientId = await registerClaudeCimdClient(mc.domain, accessToken);
+    await ensureMcpResourceServer(mc.domain, accessToken, mcpResourceIdentifier);
+    await ensureClaudeClientGrant(mc.domain, accessToken, cimdClientId, mcpResourceIdentifier);
+    console.log(`MCP configured: client_id=${cimdClientId} resource=${mcpResourceIdentifier}`);
+
     let warning: string | undefined;
+
+    // AWS-side wiring for the log stream we just created: associate the partner
+    // event bus and route its events into the analytics lake. Non-fatal so an
+    // EventBridge hiccup doesn't mark an otherwise-configured tenant failed.
+    try {
+      await wireEventBridgeBus(mc.tenant_name, mc.domain);
+    } catch (busErr) {
+      const msg = (busErr as Error).message;
+      console.error('Event bus wiring failed (non-fatal):', msg);
+      warning = `Event bus wiring failed: ${msg}`;
+    }
+
     try {
       await createPortal(mc.domain, accessToken, passkeyConnectionId);
     } catch (portalErr) {
       const msg = (portalErr as Error).message;
       console.error('Portal configuration failed (non-fatal):', msg);
       warning = `Portal setup failed: ${msg}`;
+    }
+
+    // Enterprise OIDC connector to ciam (optional until creds are configured).
+    if (CIAM_OIDC_CLIENT_ID && CIAM_OIDC_CLIENT_SECRET_ARN) {
+      try {
+        // Home Realm Discovery: route the tenant owner's email domain straight
+        // to the dvly-solutions (ciam) IdP.
+        const emailDomain = mc.created_by_email?.includes('@')
+          ? mc.created_by_email.split('@')[1]?.toLowerCase()
+          : undefined;
+        const ciamClientSecret = await getCiamOidcClientSecret();
+        await ensureCiamEnterpriseConnection(mc.domain, accessToken, CIAM_OIDC_CLIENT_ID, ciamClientSecret, emailDomain);
+      } catch (ciamErr) {
+        const msg = (ciamErr as Error).message;
+        console.error('Enterprise OIDC connector failed (non-fatal):', msg);
+        warning = warning ? `${warning}; Enterprise OIDC connector failed: ${msg}` : `Enterprise OIDC connector failed: ${msg}`;
+      }
+    } else {
+      console.warn('Enterprise OIDC connector skipped: CIAM_OIDC_CLIENT_ID / CIAM_OIDC_CLIENT_SECRET_ARN not configured');
     }
 
     await markTenantStatus(tenantId, 'ready', undefined, warning);
